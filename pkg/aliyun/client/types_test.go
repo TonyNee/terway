@@ -56,31 +56,31 @@ func TestFromCreateResp(t *testing.T) {
 }
 
 func TestFromDescribeResp(t *testing.T) {
-	resp := &ecs.NetworkInterfaceSet{
-		Status:             "InUse",
-		MacAddress:         "02:11:22:33:44:66",
-		NetworkInterfaceId: "eni-2",
-		VSwitchId:          "vsw-2",
-		PrivateIpAddress:   "10.0.0.2",
-		ZoneId:             "cn-hangzhou-b",
-		SecurityGroupIds:   ecs.SecurityGroupIdsInDescribeNetworkInterfaces{SecurityGroupId: []string{"sg-2"}},
-		Ipv6Sets: ecs.Ipv6SetsInDescribeNetworkInterfaces{
-			Ipv6Set: []ecs.Ipv6Set{{Ipv6Address: "fe80::2"}},
+	resp := &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSet{
+		Status:             ptr.To("InUse"),
+		MacAddress:         ptr.To("02:11:22:33:44:66"),
+		NetworkInterfaceId: ptr.To("eni-2"),
+		VSwitchId:          ptr.To("vsw-2"),
+		PrivateIpAddress:   ptr.To("10.0.0.2"),
+		ZoneId:             ptr.To("cn-hangzhou-b"),
+		SecurityGroupIds:   &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetSecurityGroupIds{SecurityGroupId: []*string{ptr.To("sg-2")}},
+		Ipv6Sets: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetIpv6Sets{
+			Ipv6Set: []*ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetIpv6SetsIpv6Set{{Ipv6Address: ptr.To("fe80::2"), Primary: ptr.To(true)}},
 		},
-		PrivateIpSets: ecs.PrivateIpSetsInDescribeNetworkInterfaces{
-			PrivateIpSet: []ecs.PrivateIpSet{{PrivateIpAddress: "10.0.0.2", Primary: false}},
+		PrivateIpSets: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetPrivateIpSets{
+			PrivateIpSet: []*ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetPrivateIpSetsPrivateIpSet{{PrivateIpAddress: ptr.To("10.0.0.2"), Primary: ptr.To(false)}},
 		},
-		Tags: ecs.TagsInDescribeNetworkInterfaces{
-			Tag: []ecs.Tag{{Key: "k2", Value: "v2"}},
+		Tags: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetTags{
+			Tag: []*ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetTagsTag{{TagKey: ptr.To("k2"), TagValue: ptr.To("v2")}},
 		},
-		Type:         "Secondary",
-		CreationTime: "2024-01-01T00:00:00Z",
-		Attachment: ecs.Attachment{
-			InstanceId:              "i-123",
-			TrunkNetworkInterfaceId: "eni-trunk",
-			DeviceIndex:             1,
+		Type:         ptr.To("Secondary"),
+		CreationTime: ptr.To("2024-01-01T00:00:00Z"),
+		Attachment: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetAttachment{
+			InstanceId:              ptr.To("i-123"),
+			TrunkNetworkInterfaceId: ptr.To("eni-trunk"),
+			DeviceIndex:             ptr.To(int32(1)),
 		},
-		NetworkInterfaceTrafficMode: "Standard",
+		NetworkInterfaceTrafficMode: ptr.To("Standard"),
 	}
 	ni := FromDescribeResp(resp)
 	if ni.Status != "InUse" || ni.MacAddress != "02:11:22:33:44:66" || ni.NetworkInterfaceID != "eni-2" || ni.VSwitchID != "vsw-2" || ni.PrivateIPAddress != "10.0.0.2" {
@@ -89,13 +89,13 @@ func TestFromDescribeResp(t *testing.T) {
 	if len(ni.PrivateIPSets) != 1 || ni.PrivateIPSets[0].IPAddress != "10.0.0.2" || ni.PrivateIPSets[0].Primary {
 		t.Errorf("unexpected PrivateIPSets: %+v", ni.PrivateIPSets)
 	}
-	if len(ni.IPv6Set) != 1 || ni.IPv6Set[0].IPAddress != "fe80::2" {
+	if len(ni.IPv6Set) != 1 || ni.IPv6Set[0].IPAddress != "fe80::2" || !ni.IPv6Set[0].Primary {
 		t.Errorf("unexpected IPv6Set: %+v", ni.IPv6Set)
 	}
 	if len(ni.SecurityGroupIDs) != 1 || ni.SecurityGroupIDs[0] != "sg-2" {
 		t.Errorf("unexpected SecurityGroupIDs: %+v", ni.SecurityGroupIDs)
 	}
-	if len(ni.Tags) != 1 || ni.Tags[0].Key != "k2" || ni.Tags[0].Value != "v2" {
+	if len(ni.Tags) != 1 || ni.Tags[0].TagKey != "k2" || ni.Tags[0].TagValue != "v2" {
 		t.Errorf("unexpected Tags: %+v", ni.Tags)
 	}
 	if ni.Type != "Secondary" || ni.CreationTime != "2024-01-01T00:00:00Z" {
@@ -150,22 +150,22 @@ func TestFromCreateResp_WithPrefixes(t *testing.T) {
 }
 
 func TestFromDescribeResp_WithPrefixes(t *testing.T) {
-	resp := &ecs.NetworkInterfaceSet{
-		Status:             "InUse",
-		MacAddress:         "02:aa:bb:cc:dd:ff",
-		NetworkInterfaceId: "eni-prefix-desc",
-		VSwitchId:          "vsw-2",
-		PrivateIpAddress:   "10.0.1.1",
-		Type:               "Secondary",
-		Ipv4PrefixSets: ecs.Ipv4PrefixSetsInDescribeNetworkInterfaces{
-			Ipv4PrefixSet: []ecs.Ipv4PrefixSet{
-				{Ipv4Prefix: "10.0.1.0/28"},
+	resp := &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSet{
+		Status:             ptr.To("InUse"),
+		MacAddress:         ptr.To("02:aa:bb:cc:dd:ff"),
+		NetworkInterfaceId: ptr.To("eni-prefix-desc"),
+		VSwitchId:          ptr.To("vsw-2"),
+		PrivateIpAddress:   ptr.To("10.0.1.1"),
+		Type:               ptr.To("Secondary"),
+		Ipv4PrefixSets: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetIpv4PrefixSets{
+			Ipv4PrefixSet: []*ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetIpv4PrefixSetsIpv4PrefixSet{
+				{Ipv4Prefix: ptr.To("10.0.1.0/28")},
 			},
 		},
-		Ipv6PrefixSets: ecs.Ipv6PrefixSetsInDescribeNetworkInterfaces{
-			Ipv6PrefixSet: []ecs.Ipv6PrefixSet{
-				{Ipv6Prefix: "fd00::/80"},
-				{Ipv6Prefix: "fd01::/80"},
+		Ipv6PrefixSets: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetIpv6PrefixSets{
+			Ipv6PrefixSet: []*ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetIpv6PrefixSetsIpv6PrefixSet{
+				{Ipv6Prefix: ptr.To("fd00::/80")},
+				{Ipv6Prefix: ptr.To("fd01::/80")},
 			},
 		},
 	}
@@ -182,10 +182,10 @@ func TestFromDescribeResp_WithPrefixes(t *testing.T) {
 }
 
 func TestFromDescribeResp_InstanceIDFromAttachment(t *testing.T) {
-	resp := &ecs.NetworkInterfaceSet{
-		NetworkInterfaceId: "eni-attach",
-		Attachment: ecs.Attachment{
-			InstanceId: "i-from-attachment",
+	resp := &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSet{
+		NetworkInterfaceId: ptr.To("eni-attach"),
+		Attachment: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetAttachment{
+			InstanceId: ptr.To("i-from-attachment"),
 		},
 	}
 	ni := FromDescribeResp(resp)
@@ -204,10 +204,10 @@ func TestFromDescribeResp_NetworkCardIndex(t *testing.T) {
 		{name: "third card", index: 2},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			resp := &ecs.NetworkInterfaceSet{
-				Attachment: ecs.Attachment{
-					DeviceIndex:      3,
-					NetworkCardIndex: tt.index,
+			resp := &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSet{
+				Attachment: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetAttachment{
+					DeviceIndex:      ptr.To(int32(3)),
+					NetworkCardIndex: ptr.To(int32(tt.index)),
 				},
 			}
 			ni := FromDescribeResp(resp)

@@ -11,6 +11,7 @@ import (
 	k8sClient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	aliClient "github.com/AliyunContainerService/terway/pkg/aliyun/client"
+	apiErr "github.com/AliyunContainerService/terway/pkg/aliyun/client/errors"
 	networkv1beta1 "github.com/AliyunContainerService/terway/pkg/apis/network.alibabacloud.com/v1beta1"
 	"github.com/AliyunContainerService/terway/types"
 )
@@ -260,7 +261,7 @@ func extractRequestID(err error) string {
 		}
 		return se.Comment()
 	}
-	return ""
+	return apiErr.ErrRequestID(err)
 }
 
 // formatENISummary returns a compact representation of an ENI for diagnostic output.

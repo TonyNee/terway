@@ -7,7 +7,6 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	ecs20140526 "github.com/alibabacloud-go/ecs-20140526/v7/client"
-	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -224,7 +223,7 @@ func TestFromAttributeResp_AllFields(t *testing.T) {
 		InstanceId:         ptr.To("i-001"),
 		Ipv6Sets: &ecs20140526.DescribeNetworkInterfaceAttributeResponseBodyIpv6Sets{
 			Ipv6Set: []*ecs20140526.DescribeNetworkInterfaceAttributeResponseBodyIpv6SetsIpv6Set{
-				{Ipv6Address: ptr.To("::1")},
+				{Ipv6Address: ptr.To("::1"), Primary: ptr.To(true)},
 			},
 		},
 		PrivateIpSets: &ecs20140526.DescribeNetworkInterfaceAttributeResponseBodyPrivateIpSets{
@@ -255,6 +254,7 @@ func TestFromAttributeResp_AllFields(t *testing.T) {
 	assert.Equal(t, "i-001", ni.InstanceID)
 	assert.Len(t, ni.IPv6Set, 1)
 	assert.Equal(t, "::1", ni.IPv6Set[0].IPAddress)
+	assert.True(t, ni.IPv6Set[0].Primary)
 	assert.Len(t, ni.PrivateIPSets, 1)
 	assert.Len(t, ni.Tags, 1)
 	assert.Equal(t, "k1", ni.Tags[0].TagKey)
@@ -294,15 +294,15 @@ func TestECSService_describeNetworkInterfaceByID_ENIAttributeBasicDisabled(t *te
 	require.NoError(t, utilfeature.DefaultMutableFeatureGate.Set("ENIAttributeBasic=false"))
 
 	patches := gomonkey.ApplyFunc(
-		(*ecs.Client).DescribeNetworkInterfaces,
-		func(_ *ecs.Client, req *ecs.DescribeNetworkInterfacesRequest) (*ecs.DescribeNetworkInterfacesResponse, error) {
-			return &ecs.DescribeNetworkInterfacesResponse{
-				NetworkInterfaceSets: ecs.NetworkInterfaceSets{
-					NetworkInterfaceSet: []ecs.NetworkInterfaceSet{
-						{NetworkInterfaceId: "eni-001"},
+		(*ecs20140526.Client).DescribeNetworkInterfaces,
+		func(_ *ecs20140526.Client, req *ecs20140526.DescribeNetworkInterfacesRequest) (*ecs20140526.DescribeNetworkInterfacesResponse, error) {
+			return &ecs20140526.DescribeNetworkInterfacesResponse{Body: &ecs20140526.DescribeNetworkInterfacesResponseBody{
+				NetworkInterfaceSets: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSets{
+					NetworkInterfaceSet: []*ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSet{
+						{NetworkInterfaceId: ptr.To("eni-001")},
 					},
 				},
-			}, nil
+			}}, nil
 		},
 	)
 	defer patches.Reset()

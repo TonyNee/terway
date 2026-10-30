@@ -415,22 +415,25 @@ func (o *DescribeNetworkInterfaceOptions) ApplyTo(in *DescribeNetworkInterfaceOp
 	}
 }
 
-func (o *DescribeNetworkInterfaceOptions) ECS() *ecs.DescribeNetworkInterfacesRequest {
-	req := ecs.CreateDescribeNetworkInterfacesRequest()
+func (o *DescribeNetworkInterfaceOptions) ECS(regionID string) *ecs20140526.DescribeNetworkInterfacesRequest {
+	req := &ecs20140526.DescribeNetworkInterfacesRequest{}
+	req.RegionId = ptr.To(regionID)
 	if o.VPCID != nil {
-		req.VpcId = *o.VPCID
+		req.VpcId = o.VPCID
 	}
 	if o.NetworkInterfaceIDs != nil {
-		req.NetworkInterfaceId = o.NetworkInterfaceIDs
+		for _, id := range *o.NetworkInterfaceIDs {
+			req.NetworkInterfaceId = append(req.NetworkInterfaceId, ptr.To(id))
+		}
 	}
 	if o.InstanceID != nil {
-		req.InstanceId = *o.InstanceID
+		req.InstanceId = o.InstanceID
 	}
 	if o.InstanceType != nil {
-		req.Type = *o.InstanceType
+		req.Type = o.InstanceType
 	}
 	if o.Status != nil {
-		req.Status = *o.Status
+		req.Status = o.Status
 	}
 	// Tags are filtered locally to avoid the ECS tag query resource limit.
 

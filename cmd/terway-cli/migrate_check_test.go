@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/alibabacloud-go/tea/tea"
 	sdkErr "github.com/aliyun/alibaba-cloud-sdk-go/sdk/errors"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 	"github.com/stretchr/testify/assert"
@@ -11,21 +12,33 @@ import (
 	"github.com/stretchr/testify/require"
 
 	aliClient "github.com/AliyunContainerService/terway/pkg/aliyun/client"
+	apiErr "github.com/AliyunContainerService/terway/pkg/aliyun/client/errors"
 	clientMocks "github.com/AliyunContainerService/terway/pkg/aliyun/client/mocks"
 )
 
 func TestCheckOpenAPIPrerequisiteDescribeErrorIncludesRequestID(t *testing.T) {
 	t.Parallel()
 
-	ecsClient := clientMocks.NewECS(t)
-	ecsClient.On("DescribeNetworkInterface2", mock.Anything, mock.Anything).
-		Return(nil, sdkErr.NewServerError(500, "{\"Code\":\"InternalError\"}", "req-123"))
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "legacy SDK", err: sdkErr.NewServerError(500, `{"Code":"InternalError"}`, "req-123")},
+		{name: "native SDK", err: &tea.SDKError{Code: tea.String("InternalError"), Data: tea.String(`{"RequestId":"req-123"}`)}},
+		{name: "wrapped native SDK", err: apiErr.WarpError2(&tea.SDKError{Code: tea.String("InternalError"), Data: tea.String(`{"RequestId":"req-123"}`)})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ecsClient := clientMocks.NewECS(t)
+			ecsClient.On("DescribeNetworkInterface2", mock.Anything, mock.Anything).
+				Return(nil, tc.err).Once()
 
-	passed, msgs := checkOpenAPIPrerequisite(context.Background(), ecsClient, "i-123")
-	require.False(t, passed)
-	require.Len(t, msgs, 1)
-	assert.Contains(t, msgs[0], "failed to describe ENIs for instance i-123")
-	assert.Contains(t, msgs[0], "requestID=req-123")
+			passed, msgs := checkOpenAPIPrerequisite(context.Background(), ecsClient, "i-123")
+			require.False(t, passed)
+			require.Len(t, msgs, 1)
+			assert.Contains(t, msgs[0], "failed to describe ENIs for instance i-123")
+			assert.Contains(t, msgs[0], "requestID=req-123")
+		})
+	}
 }
 
 func TestCheckOpenAPIPrerequisiteIncludesObservedENIDetails(t *testing.T) {

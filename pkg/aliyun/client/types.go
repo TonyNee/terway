@@ -151,44 +151,53 @@ func FromCreateResp(in *ecs20140526.CreateNetworkInterfaceResponseBody) *Network
 	return r
 }
 
-func FromDescribeResp(in *ecs.NetworkInterfaceSet) *NetworkInterface {
-	ins := in.InstanceId
-	if in.InstanceId == "" {
-		ins = in.Attachment.InstanceId
+func FromDescribeResp(in *ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSet) *NetworkInterface {
+	attachment := FromPtr(in.Attachment)
+	ins := FromPtr(in.InstanceId)
+	if ins == "" {
+		ins = FromPtr(attachment.InstanceId)
 	}
 
 	return &NetworkInterface{
-		Status:             in.Status,
-		MacAddress:         in.MacAddress,
-		NetworkInterfaceID: in.NetworkInterfaceId,
+		Status:             FromPtr(in.Status),
+		MacAddress:         FromPtr(in.MacAddress),
+		NetworkInterfaceID: FromPtr(in.NetworkInterfaceId),
 		InstanceID:         ins,
-		VSwitchID:          in.VSwitchId,
-		PrivateIPAddress:   in.PrivateIpAddress,
-		ZoneID:             in.ZoneId,
-		SecurityGroupIDs:   in.SecurityGroupIds.SecurityGroupId,
-		IPv6Set: lo.Map(in.Ipv6Sets.Ipv6Set, func(item ecs.Ipv6Set, _ int) IPSet {
+		VSwitchID:          FromPtr(in.VSwitchId),
+		PrivateIPAddress:   FromPtr(in.PrivateIpAddress),
+		ZoneID:             FromPtr(in.ZoneId),
+		SecurityGroupIDs: lo.Map(FromPtr(in.SecurityGroupIds).SecurityGroupId, func(item *string, _ int) string {
+			return FromPtr(item)
+		}),
+		IPv6Set: lo.Map(FromPtr(in.Ipv6Sets).Ipv6Set, func(item *ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetIpv6SetsIpv6Set, _ int) IPSet {
 			return IPSet{
-				IPAddress: item.Ipv6Address,
+				IPAddress: FromPtr(item.Ipv6Address),
+				Primary:   FromPtr(item.Primary),
 			}
 		}),
-		PrivateIPSets: lo.Map(in.PrivateIpSets.PrivateIpSet, func(item ecs.PrivateIpSet, _ int) IPSet {
+		PrivateIPSets: lo.Map(FromPtr(in.PrivateIpSets).PrivateIpSet, func(item *ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetPrivateIpSetsPrivateIpSet, _ int) IPSet {
 			return IPSet{
-				IPAddress: item.PrivateIpAddress,
-				Primary:   item.Primary,
+				IPAddress: FromPtr(item.PrivateIpAddress),
+				Primary:   FromPtr(item.Primary),
 			}
 		}),
-		Tags:                        in.Tags.Tag,
-		TrunkNetworkInterfaceID:     in.Attachment.TrunkNetworkInterfaceId,
-		NetworkInterfaceTrafficMode: in.NetworkInterfaceTrafficMode,
-		DeviceIndex:                 in.Attachment.DeviceIndex,
-		NetworkCardIndex:            in.Attachment.NetworkCardIndex,
-		Type:                        in.Type,
-		CreationTime:                in.CreationTime,
-		IPv4PrefixSets: lo.Map(in.Ipv4PrefixSets.Ipv4PrefixSet, func(item ecs.Ipv4PrefixSet, _ int) Prefix {
-			return Prefix(item.Ipv4Prefix)
+		Tags: lo.Map(FromPtr(in.Tags).Tag, func(item *ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetTagsTag, _ int) ecs.Tag {
+			return ecs.Tag{
+				TagKey:   FromPtr(item.TagKey),
+				TagValue: FromPtr(item.TagValue),
+			}
 		}),
-		IPv6PrefixSets: lo.Map(in.Ipv6PrefixSets.Ipv6PrefixSet, func(item ecs.Ipv6PrefixSet, _ int) Prefix {
-			return Prefix(item.Ipv6Prefix)
+		TrunkNetworkInterfaceID:     FromPtr(attachment.TrunkNetworkInterfaceId),
+		NetworkInterfaceTrafficMode: FromPtr(in.NetworkInterfaceTrafficMode),
+		DeviceIndex:                 int(FromPtr(attachment.DeviceIndex)),
+		NetworkCardIndex:            int(FromPtr(attachment.NetworkCardIndex)),
+		Type:                        FromPtr(in.Type),
+		CreationTime:                FromPtr(in.CreationTime),
+		IPv4PrefixSets: lo.Map(FromPtr(in.Ipv4PrefixSets).Ipv4PrefixSet, func(item *ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetIpv4PrefixSetsIpv4PrefixSet, _ int) Prefix {
+			return Prefix(FromPtr(item.Ipv4Prefix))
+		}),
+		IPv6PrefixSets: lo.Map(FromPtr(in.Ipv6PrefixSets).Ipv6PrefixSet, func(item *ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetIpv6PrefixSetsIpv6PrefixSet, _ int) Prefix {
+			return Prefix(FromPtr(item.Ipv6Prefix))
 		}),
 	}
 }

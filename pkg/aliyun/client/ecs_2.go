@@ -6,10 +6,10 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/utils/ptr"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiErr "github.com/AliyunContainerService/terway/pkg/aliyun/client/errors"
@@ -36,33 +36,33 @@ func (a *ECSService) DescribeNetworkInterface2(ctx context.Context, opts ...Desc
 			return nil, err
 		}
 
-		req := options.ECS()
-		req.NextToken = nextToken
-		req.MaxResults = requests.NewInteger(maxSinglePageSize)
+		req := options.ECS(a.ClientSet.RegionID())
+		req.NextToken = ptr.To(nextToken)
+		req.MaxResults = ptr.To(int32(maxSinglePageSize))
 
 		l := LogFields(logf.FromContext(ctx), req)
 
 		start := time.Now()
-		resp, err := a.ClientSet.ECS().DescribeNetworkInterfaces(req)
+		resp, err := a.ClientSet.ECSV2().DescribeNetworkInterfaces(req)
 		metric.OpenAPILatency.WithLabelValues(APIDescribeNetworkInterfaces, fmt.Sprint(err != nil)).Observe(metric.MsSince(start))
 		if err != nil {
-			err = apiErr.WarpError(err)
+			err = apiErr.WarpError2(err)
 			l.WithValues(LogFieldRequestID, apiErr.ErrRequestID(err)).Error(err, "error describe eni")
 			return nil, err
 		}
-		for _, r := range resp.NetworkInterfaceSets.NetworkInterfaceSet {
-			result = append(result, FromDescribeResp(&r))
+		for _, r := range FromPtr(resp.Body.NetworkInterfaceSets).NetworkInterfaceSet {
+			result = append(result, FromDescribeResp(r))
 		}
 
-		l.WithValues(LogFieldRequestID, resp.RequestId, "count", len(result)).Info("describe enis")
+		l.WithValues(LogFieldRequestID, FromPtr(resp.Body.RequestId), "count", len(result)).Info("describe enis")
 
-		if len(resp.NetworkInterfaceSets.NetworkInterfaceSet) < maxSinglePageSize {
+		if len(FromPtr(resp.Body.NetworkInterfaceSets).NetworkInterfaceSet) < maxSinglePageSize {
 			break
 		}
-		if resp.NextToken == "" {
+		if FromPtr(resp.Body.NextToken) == "" {
 			break
 		}
-		nextToken = resp.NextToken
+		nextToken = FromPtr(resp.Body.NextToken)
 	}
 	if options.Tags != nil {
 		result = filterNetworkInterfacesByTags(result, *options.Tags)

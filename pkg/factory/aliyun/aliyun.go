@@ -487,7 +487,7 @@ func (a *Aliyun) GetAttachedNetworkInterface(trunkENIID string) ([]*daemon.ENI, 
 			if innerErr == nil {
 				return true, nil
 			}
-			if apiErr.ErrAssert(apiErr.ErrForbidden, innerErr) {
+			if apiErr.ErrorCodeIs(innerErr, apiErr.ErrForbidden) {
 				return true, innerErr
 			}
 			return false, nil

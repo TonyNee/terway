@@ -7,11 +7,13 @@ import (
 	"testing"
 
 	"github.com/AliyunContainerService/terway/pkg/aliyun/client"
+	apiErr "github.com/AliyunContainerService/terway/pkg/aliyun/client/errors"
 	mockclient "github.com/AliyunContainerService/terway/pkg/aliyun/client/mocks"
 	"github.com/AliyunContainerService/terway/pkg/aliyun/eni"
 	vswpool "github.com/AliyunContainerService/terway/pkg/vswitch"
 	"github.com/AliyunContainerService/terway/types/daemon"
 
+	"github.com/alibabacloud-go/tea/tea"
 	sdkErr "github.com/aliyun/alibaba-cloud-sdk-go/sdk/errors"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/vpc"
 	"github.com/jarcoal/httpmock"
@@ -578,20 +580,30 @@ func TestAliyun_GetAttachedNetworkInterface_NoFeatNoTags(t *testing.T) {
 }
 
 func TestAliyun_GetAttachedNetworkInterface_DescribeForbidden(t *testing.T) {
-	openAPI := mockclient.NewOpenAPI(t)
-	ecsClient := mockclient.NewECS(t)
-	getter := &multiENIInfoGetter{enis: []*daemon.ENI{{ID: "eni-1", MAC: "00:11:22:33:44:55"}}}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "legacy SDK", err: sdkErr.NewServerError(403, `{"Code":"Forbidden.RAM"}`, "test-request-id")},
+		{name: "native SDK", err: &tea.SDKError{Code: tea.String(apiErr.ErrForbidden)}},
+		{name: "wrapped native SDK", err: apiErr.WarpError2(&tea.SDKError{Code: tea.String(apiErr.ErrForbidden)})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			openAPI := mockclient.NewOpenAPI(t)
+			ecsClient := mockclient.NewECS(t)
+			getter := &multiENIInfoGetter{enis: []*daemon.ENI{{ID: "eni-1", MAC: "00:11:22:33:44:55"}}}
 
-	openAPI.On("GetECS").Return(ecsClient)
-	ecsClient.On("DescribeNetworkInterface", mock.Anything, "", []string{"eni-1"}, "", "", "", mock.Anything).
-		Return(nil, sdkErr.NewServerError(403, `{"Code":"Forbidden.RAM"}`, "test-request-id")).Once()
+			openAPI.On("GetECS").Return(ecsClient)
+			ecsClient.On("DescribeNetworkInterface", mock.Anything, "", []string{"eni-1"}, "", "", "", mock.Anything).
+				Return(nil, tc.err).Once()
 
-	a := NewAliyun(context.Background(), openAPI, getter, nil, &daemon.ENIConfig{EniTypeAttr: daemon.FeatTrunk})
-	enis, err := a.GetAttachedNetworkInterface("")
+			a := NewAliyun(context.Background(), openAPI, getter, nil, &daemon.ENIConfig{EniTypeAttr: daemon.FeatTrunk})
+			enis, err := a.GetAttachedNetworkInterface("")
 
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "Forbidden")
-	assert.Nil(t, enis)
+			assert.ErrorIs(t, err, tc.err)
+			assert.Nil(t, enis)
+		})
+	}
 }
 
 func TestAliyun_DeleteNetworkInterface_DetachError(t *testing.T) {

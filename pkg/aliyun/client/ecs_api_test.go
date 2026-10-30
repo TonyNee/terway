@@ -280,11 +280,11 @@ func TestECSService_DeleteNetworkInterface_WithGomonkey(t *testing.T) {
 	// After a successful delete, the code polls DescribeNetworkInterfaces to
 	// confirm the ENI is gone. Return an empty list so the poll succeeds.
 	patches.ApplyFunc(
-		(*ecs.Client).DescribeNetworkInterfaces,
-		func(client *ecs.Client, request *ecs.DescribeNetworkInterfacesRequest) (*ecs.DescribeNetworkInterfacesResponse, error) {
-			return &ecs.DescribeNetworkInterfacesResponse{
-				NetworkInterfaceSets: ecs.NetworkInterfaceSets{},
-			}, nil
+		(*ecs20140526.Client).DescribeNetworkInterfaces,
+		func(client *ecs20140526.Client, request *ecs20140526.DescribeNetworkInterfacesRequest) (*ecs20140526.DescribeNetworkInterfacesResponse, error) {
+			return &ecs20140526.DescribeNetworkInterfacesResponse{Body: &ecs20140526.DescribeNetworkInterfacesResponseBody{
+				NetworkInterfaceSets: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSets{},
+			}}, nil
 		},
 	)
 
@@ -866,59 +866,59 @@ func TestECSService_DescribeNetworkInterface_WithGomonkey(t *testing.T) {
 	ecsService := createTestECSServiceForAPI()
 
 	// Mock response
-	mockResponse := &ecs.DescribeNetworkInterfacesResponse{
-		RequestId: "test-request-id",
-		NetworkInterfaceSets: ecs.NetworkInterfaceSets{
-			NetworkInterfaceSet: []ecs.NetworkInterfaceSet{
+	mockResponse := &ecs20140526.DescribeNetworkInterfacesResponse{Body: &ecs20140526.DescribeNetworkInterfacesResponseBody{
+		RequestId: ptr.To("test-request-id"),
+		NetworkInterfaceSets: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSets{
+			NetworkInterfaceSet: []*ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSet{
 				{
-					Status:             "InUse",
-					MacAddress:         "02:11:22:33:44:55",
-					NetworkInterfaceId: "eni-test-001",
-					VSwitchId:          "vsw-test-001",
-					PrivateIpAddress:   "10.0.0.100",
-					ZoneId:             "cn-hangzhou-a",
-					SecurityGroupIds: ecs.SecurityGroupIdsInDescribeNetworkInterfaces{
-						SecurityGroupId: []string{"sg-test-001"},
+					Status:             ptr.To("InUse"),
+					MacAddress:         ptr.To("02:11:22:33:44:55"),
+					NetworkInterfaceId: ptr.To("eni-test-001"),
+					VSwitchId:          ptr.To("vsw-test-001"),
+					PrivateIpAddress:   ptr.To("10.0.0.100"),
+					ZoneId:             ptr.To("cn-hangzhou-a"),
+					SecurityGroupIds: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetSecurityGroupIds{
+						SecurityGroupId: []*string{ptr.To("sg-test-001")},
 					},
-					PrivateIpSets: ecs.PrivateIpSetsInDescribeNetworkInterfaces{
-						PrivateIpSet: []ecs.PrivateIpSet{
+					PrivateIpSets: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetPrivateIpSets{
+						PrivateIpSet: []*ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetPrivateIpSetsPrivateIpSet{
 							{
-								PrivateIpAddress: "10.0.0.100",
-								Primary:          true,
+								PrivateIpAddress: ptr.To("10.0.0.100"),
+								Primary:          ptr.To(true),
 							},
 						},
 					},
-					Tags: ecs.TagsInDescribeNetworkInterfaces{
-						Tag: []ecs.Tag{
+					Tags: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetTags{
+						Tag: []*ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetTagsTag{
 							{
-								Key:   "Name",
-								Value: "test-eni",
+								TagKey:   ptr.To("Name"),
+								TagValue: ptr.To("test-eni"),
 							},
 						},
 					},
-					Type:         "Secondary",
-					CreationTime: "2024-01-01T00:00:00Z",
-					Attachment: ecs.Attachment{
-						InstanceId:              "i-test-001",
-						TrunkNetworkInterfaceId: "",
-						DeviceIndex:             1,
+					Type:         ptr.To("Secondary"),
+					CreationTime: ptr.To("2024-01-01T00:00:00Z"),
+					Attachment: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetAttachment{
+						InstanceId:              ptr.To("i-test-001"),
+						TrunkNetworkInterfaceId: ptr.To(""),
+						DeviceIndex:             ptr.To(int32(1)),
 					},
-					NetworkInterfaceTrafficMode: "Standard",
+					NetworkInterfaceTrafficMode: ptr.To("Standard"),
 				},
 			},
 		},
-	}
+	}}
 
 	// Mock DescribeNetworkInterfaces method
 	patches := gomonkey.ApplyFunc(
-		(*ecs.Client).DescribeNetworkInterfaces,
-		func(client *ecs.Client, request *ecs.DescribeNetworkInterfacesRequest) (*ecs.DescribeNetworkInterfacesResponse, error) {
+		(*ecs20140526.Client).DescribeNetworkInterfaces,
+		func(client *ecs20140526.Client, request *ecs20140526.DescribeNetworkInterfacesRequest) (*ecs20140526.DescribeNetworkInterfacesResponse, error) {
 			// Verify request parameters
-			assert.Equal(t, "vpc-test-001", request.VpcId)
-			assert.Equal(t, []string{"eni-test-001"}, *request.NetworkInterfaceId)
-			assert.Equal(t, "i-test-001", request.InstanceId)
-			assert.Equal(t, "Secondary", request.Type)
-			assert.Equal(t, "InUse", request.Status)
+			assert.Equal(t, "vpc-test-001", FromPtr(request.VpcId))
+			assert.Equal(t, []*string{ptr.To("eni-test-001")}, request.NetworkInterfaceId)
+			assert.Equal(t, "i-test-001", FromPtr(request.InstanceId))
+			assert.Equal(t, "Secondary", FromPtr(request.Type))
+			assert.Equal(t, "InUse", FromPtr(request.Status))
 
 			return mockResponse, nil
 		},
@@ -954,8 +954,8 @@ func TestECSService_DescribeNetworkInterface_WithGomonkey(t *testing.T) {
 	assert.Equal(t, "10.0.0.100", eni.PrivateIPSets[0].IPAddress)
 	assert.True(t, eni.PrivateIPSets[0].Primary)
 	assert.Len(t, eni.Tags, 1)
-	assert.Equal(t, "Name", eni.Tags[0].Key)
-	assert.Equal(t, "test-eni", eni.Tags[0].Value)
+	assert.Equal(t, "Name", eni.Tags[0].TagKey)
+	assert.Equal(t, "test-eni", eni.Tags[0].TagValue)
 	assert.Equal(t, "Secondary", eni.Type)
 	assert.Equal(t, "2024-01-01T00:00:00Z", eni.CreationTime)
 	assert.Equal(t, "i-test-001", eni.InstanceID)
@@ -968,59 +968,59 @@ func TestECSService_DescribeNetworkInterface2_WithGomonkey(t *testing.T) {
 	ecsService := createTestECSServiceForAPI()
 
 	// Mock response
-	mockResponse := &ecs.DescribeNetworkInterfacesResponse{
-		RequestId: "test-request-id-2",
-		NetworkInterfaceSets: ecs.NetworkInterfaceSets{
-			NetworkInterfaceSet: []ecs.NetworkInterfaceSet{
+	mockResponse := &ecs20140526.DescribeNetworkInterfacesResponse{Body: &ecs20140526.DescribeNetworkInterfacesResponseBody{
+		RequestId: ptr.To("test-request-id-2"),
+		NetworkInterfaceSets: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSets{
+			NetworkInterfaceSet: []*ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSet{
 				{
-					Status:             "Available",
-					MacAddress:         "02:11:22:33:44:66",
-					NetworkInterfaceId: "eni-test-002",
-					VSwitchId:          "vsw-test-002",
-					PrivateIpAddress:   "10.0.0.200",
-					ZoneId:             "cn-hangzhou-b",
-					SecurityGroupIds: ecs.SecurityGroupIdsInDescribeNetworkInterfaces{
-						SecurityGroupId: []string{"sg-test-002"},
+					Status:             ptr.To("Available"),
+					MacAddress:         ptr.To("02:11:22:33:44:66"),
+					NetworkInterfaceId: ptr.To("eni-test-002"),
+					VSwitchId:          ptr.To("vsw-test-002"),
+					PrivateIpAddress:   ptr.To("10.0.0.200"),
+					ZoneId:             ptr.To("cn-hangzhou-b"),
+					SecurityGroupIds: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetSecurityGroupIds{
+						SecurityGroupId: []*string{ptr.To("sg-test-002")},
 					},
-					PrivateIpSets: ecs.PrivateIpSetsInDescribeNetworkInterfaces{
-						PrivateIpSet: []ecs.PrivateIpSet{
+					PrivateIpSets: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetPrivateIpSets{
+						PrivateIpSet: []*ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetPrivateIpSetsPrivateIpSet{
 							{
-								PrivateIpAddress: "10.0.0.200",
-								Primary:          true,
+								PrivateIpAddress: ptr.To("10.0.0.200"),
+								Primary:          ptr.To(true),
 							},
 						},
 					},
-					Tags: ecs.TagsInDescribeNetworkInterfaces{
-						Tag: []ecs.Tag{
+					Tags: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetTags{
+						Tag: []*ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetTagsTag{
 							{
-								Key:   "Environment",
-								Value: "test",
+								TagKey:   ptr.To("Environment"),
+								TagValue: ptr.To("test"),
 							},
 						},
 					},
-					Type:         "Primary",
-					CreationTime: "2024-01-02T00:00:00Z",
-					Attachment: ecs.Attachment{
-						InstanceId:              "",
-						TrunkNetworkInterfaceId: "",
-						DeviceIndex:             0,
+					Type:         ptr.To("Primary"),
+					CreationTime: ptr.To("2024-01-02T00:00:00Z"),
+					Attachment: &ecs20140526.DescribeNetworkInterfacesResponseBodyNetworkInterfaceSetsNetworkInterfaceSetAttachment{
+						InstanceId:              ptr.To(""),
+						TrunkNetworkInterfaceId: ptr.To(""),
+						DeviceIndex:             ptr.To(int32(0)),
 					},
-					NetworkInterfaceTrafficMode: "Standard",
+					NetworkInterfaceTrafficMode: ptr.To("Standard"),
 				},
 			},
 		},
-	}
+	}}
 
 	// Mock DescribeNetworkInterfaces method
 	patches := gomonkey.ApplyFunc(
-		(*ecs.Client).DescribeNetworkInterfaces,
-		func(client *ecs.Client, request *ecs.DescribeNetworkInterfacesRequest) (*ecs.DescribeNetworkInterfacesResponse, error) {
+		(*ecs20140526.Client).DescribeNetworkInterfaces,
+		func(client *ecs20140526.Client, request *ecs20140526.DescribeNetworkInterfacesRequest) (*ecs20140526.DescribeNetworkInterfacesResponse, error) {
 			// Verify request parameters
-			assert.Equal(t, "vpc-test-002", request.VpcId)
-			assert.Equal(t, []string{"eni-test-002"}, *request.NetworkInterfaceId)
-			assert.Equal(t, "i-test-002", request.InstanceId)
-			assert.Equal(t, "Primary", request.Type)
-			assert.Equal(t, "Available", request.Status)
+			assert.Equal(t, "vpc-test-002", FromPtr(request.VpcId))
+			assert.Equal(t, []*string{ptr.To("eni-test-002")}, request.NetworkInterfaceId)
+			assert.Equal(t, "i-test-002", FromPtr(request.InstanceId))
+			assert.Equal(t, "Primary", FromPtr(request.Type))
+			assert.Equal(t, "Available", FromPtr(request.Status))
 
 			return mockResponse, nil
 		},
@@ -1056,8 +1056,8 @@ func TestECSService_DescribeNetworkInterface2_WithGomonkey(t *testing.T) {
 	assert.Equal(t, "10.0.0.200", eni.PrivateIPSets[0].IPAddress)
 	assert.True(t, eni.PrivateIPSets[0].Primary)
 	assert.Len(t, eni.Tags, 1)
-	assert.Equal(t, "Environment", eni.Tags[0].Key)
-	assert.Equal(t, "test", eni.Tags[0].Value)
+	assert.Equal(t, "Environment", eni.Tags[0].TagKey)
+	assert.Equal(t, "test", eni.Tags[0].TagValue)
 	assert.Equal(t, "Primary", eni.Type)
 	assert.Equal(t, "2024-01-02T00:00:00Z", eni.CreationTime)
 	assert.Equal(t, "", eni.InstanceID)
@@ -1363,10 +1363,10 @@ func TestECSService_DescribeNetworkInterface_WithGomonkey_Error(t *testing.T) {
 	ecsService := createTestECSServiceForAPI()
 
 	// Mock DescribeNetworkInterfaces method to return error
-	mockError := sdkErr.NewServerError(403, "{\"Code\": \"Forbidden\"}", "test-request-id")
+	mockError := &tea.SDKError{Code: ptr.To("Forbidden")}
 	patches := gomonkey.ApplyFunc(
-		(*ecs.Client).DescribeNetworkInterfaces,
-		func(client *ecs.Client, request *ecs.DescribeNetworkInterfacesRequest) (*ecs.DescribeNetworkInterfacesResponse, error) {
+		(*ecs20140526.Client).DescribeNetworkInterfaces,
+		func(client *ecs20140526.Client, request *ecs20140526.DescribeNetworkInterfacesRequest) (*ecs20140526.DescribeNetworkInterfacesResponse, error) {
 			return nil, mockError
 		},
 	)

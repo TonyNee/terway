@@ -96,6 +96,7 @@ func FromAttributeResp(in *ecs20140526.DescribeNetworkInterfaceAttributeResponse
 		r.IPv6Set = lo.Map(in.Ipv6Sets.Ipv6Set, func(item *ecs20140526.DescribeNetworkInterfaceAttributeResponseBodyIpv6SetsIpv6Set, _ int) IPSet {
 			return IPSet{
 				IPAddress: FromPtr(item.Ipv6Address),
+				Primary:   FromPtr(item.Primary),
 			}
 		})
 	}
