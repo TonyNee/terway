@@ -1,4 +1,4 @@
-From 2763edae5df9a28185f0a360397395da6b0a26a7 Mon Sep 17 00:00:00 2001
+From b05259fb52a2a489daac50bbda2da09b1de3f2e9 Mon Sep 17 00:00:00 2001
 From: l1b0k <libokang.lbk@alibaba-inc.com>
 Date: Thu, 18 Dec 2025 11:00:11 +0800
 Subject: [PATCH 04/11] endpoint: fix sip config
@@ -9,10 +9,10 @@ Signed-off-by: l1b0k <libokang.lbk@alibaba-inc.com>
  1 file changed, 4 insertions(+)
 
 diff --git a/pkg/endpoint/endpoint.go b/pkg/endpoint/endpoint.go
-index 291777e2b8..db9c78d8eb 100644
+index 6cf0cef717..fdb40ffbdf 100644
 --- a/pkg/endpoint/endpoint.go
 +++ b/pkg/endpoint/endpoint.go
-@@ -2671,6 +2671,10 @@ func (e *Endpoint) SetDefaultConfiguration() {
+@@ -2893,6 +2893,10 @@ func (e *Endpoint) SetDefaultConfiguration() {
  		return
  	}
  	e.setDefaultPolicyConfig()

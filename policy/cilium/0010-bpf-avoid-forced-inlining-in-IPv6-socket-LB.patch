@@ -1,4 +1,4 @@
-From ff47c406a16036cc570ec9e0c4192fcc71c9198d Mon Sep 17 00:00:00 2001
+From 9e98f827841cea55abb64ff199e9639c08f404ac Mon Sep 17 00:00:00 2001
 From: l1b0k <libokang.lbk@alibaba-inc.com>
 Date: Sat, 19 Sep 2026 15:01:07 +0800
 Subject: [PATCH 10/11] bpf: avoid forced inlining in IPv6 socket LB
@@ -23,30 +23,29 @@ Real dual-stack connectivity, stress and soak testing remain uncovered.
 Related: https://github.com/cilium/cilium/issues/38789#issuecomment-3696123974
 Signed-off-by: l1b0k <libokang.lbk@alibaba-inc.com>
 ---
- bpf/bpf_sock.c                          | 6 ++++--
+ bpf/bpf_sock.c                          | 5 ++++-
  bpf/complexity-tests/510/bpf_sock/3.txt | 9 +++++++++
  bpf/complexity-tests/510/bpf_sock/4.txt | 8 ++++++++
- 3 files changed, 21 insertions(+), 2 deletions(-)
+ 3 files changed, 21 insertions(+), 1 deletion(-)
  create mode 100644 bpf/complexity-tests/510/bpf_sock/3.txt
  create mode 100644 bpf/complexity-tests/510/bpf_sock/4.txt
 
 diff --git a/bpf/bpf_sock.c b/bpf/bpf_sock.c
-index 63568ef897..5d16ea0296 100644
+index 16baeee42a..cd0445106a 100644
 --- a/bpf/bpf_sock.c
 +++ b/bpf/bpf_sock.c
-@@ -986,8 +986,10 @@ int cil_sock6_pre_bind(struct bpf_sock_addr *ctx)
+@@ -1041,7 +1041,10 @@ int cil_sock6_pre_bind(struct bpf_sock_addr *ctx)
  }
  #endif /* ENABLE_HEALTH_CHECK */
  
 -static __always_inline int __sock6_xlate_fwd(struct bpf_sock_addr *ctx,
--					     const bool udp_only)
 +/* Do not force inline: host-only dual-stack socket LB can fail to load
 + * cil_sock6_sendmsg on Linux 5.10. See cilium/cilium#38789.
 + */
-+static int __sock6_xlate_fwd(struct bpf_sock_addr *ctx, const bool udp_only)
++static int __sock6_xlate_fwd(struct bpf_sock_addr *ctx,
+ 					     const bool udp_only,
+ 					     const bool is_connect)
  {
- #ifdef ENABLE_IPV6
- 	union lb6_affinity_client_id id;
 diff --git a/bpf/complexity-tests/510/bpf_sock/3.txt b/bpf/complexity-tests/510/bpf_sock/3.txt
 new file mode 100644
 index 0000000000..d1d78e3953

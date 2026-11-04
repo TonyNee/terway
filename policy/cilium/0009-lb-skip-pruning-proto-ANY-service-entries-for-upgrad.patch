@@ -1,4 +1,4 @@
-From 1255d769d77a2ec6457908b2bb5f2819e4a1b0fd Mon Sep 17 00:00:00 2001
+From 6847c0a0d3c92e5b9febfd1232c6d0e2ad3b69ea Mon Sep 17 00:00:00 2001
 From: l1b0k <libokang.lbk@alibaba-inc.com>
 Date: Tue, 2 Jun 2026 17:35:02 +0800
 Subject: [PATCH 09/11] lb: skip pruning proto=ANY service entries for upgrade
@@ -15,26 +15,25 @@ fall back to ANY, so coexistence is safe.
 
 Signed-off-by: l1b0k <libokang.lbk@alibaba-inc.com>
 ---
- pkg/loadbalancer/reconciler/bpf_reconciler.go | 9 +++++++++
- 1 file changed, 9 insertions(+)
+ pkg/loadbalancer/reconciler/bpf_reconciler.go | 8 ++++++++
+ 1 file changed, 8 insertions(+)
 
 diff --git a/pkg/loadbalancer/reconciler/bpf_reconciler.go b/pkg/loadbalancer/reconciler/bpf_reconciler.go
-index 58569a574b..42bdb449da 100644
+index e5a44b2588..464ede60e4 100644
 --- a/pkg/loadbalancer/reconciler/bpf_reconciler.go
 +++ b/pkg/loadbalancer/reconciler/bpf_reconciler.go
-@@ -509,6 +509,15 @@ func (ops *BPFOps) pruneServiceMaps() error {
- 	svcCB := func(svcKey maps.ServiceKey, svcValue maps.ServiceValue) {
- 		svcKey = svcKey.ToHost()
- 		svcValue = svcValue.ToHost()
-+
+@@ -555,6 +555,14 @@ func (ops *BPFOps) pruneServiceMaps() error {
+ 			return
+ 		}
+ 
 +		// Keep proto=ANY (legacy) entries for backward compatibility during
 +		// upgrade from cilium versions without protocol differentiation.
 +		// Old BPF programs only query with proto=0, removing these entries
 +		// before BPF reload causes connection RST.
-+		if svcKey.GetProtocol() == 0 {
++		if proto == 0 {
 +			return
 +		}
 +
- 		ac, ok := cmtypes.AddrClusterFromIP(svcKey.GetAddress())
- 		if !ok {
- 			ops.log.Warn("Prune: bad address in service key", logfields.Key, svcKey)
+ 		// Proceed to look if we can prune this non-wildcard entry
+ 		protoType := loadbalancer.NewL4TypeFromNumber(proto)
+ 		addr := loadbalancer.NewL3n4Addr(

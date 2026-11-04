@@ -1,4 +1,4 @@
-From 115824f612d4200cd6c88f21d3f40ad42ae2ad17 Mon Sep 17 00:00:00 2001
+From 7f120b4122bd4dd1555ff5fe4abcadd7f0961540 Mon Sep 17 00:00:00 2001
 From: l1b0k <libokang.lbk@alibaba-inc.com>
 Date: Thu, 13 Nov 2025 15:08:54 +0800
 Subject: [PATCH 03/11] feat(daemon): add disable per-packet LB policy flag
@@ -7,15 +7,15 @@ Signed-off-by: l1b0k <libokang.lbk@alibaba-inc.com>
 ---
  bpf/bpf_lxc.c                       | 5 +++--
  daemon/cmd/daemon_main.go           | 3 +++
- pkg/datapath/linux/config/config.go | 4 +++-
+ pkg/datapath/linux/config/config.go | 3 +++
  pkg/option/config.go                | 4 ++++
- 4 files changed, 13 insertions(+), 3 deletions(-)
+ 4 files changed, 13 insertions(+), 2 deletions(-)
 
 diff --git a/bpf/bpf_lxc.c b/bpf/bpf_lxc.c
-index eb6491d891..a681b05bf5 100644
+index b5b24bb6f8..5141c5f8a6 100644
 --- a/bpf/bpf_lxc.c
 +++ b/bpf/bpf_lxc.c
-@@ -62,11 +62,12 @@
+@@ -87,11 +87,12 @@ lxc_redirect_to_host(struct __ctx_buff *ctx, __u32 src_sec_identity,
   * Furthermore, since SCTP cannot be handled as part of bpf_sock, also
   * enable per-packet LB is SCTP is enabled.
   */
@@ -31,10 +31,10 @@ index eb6491d891..a681b05bf5 100644
  #endif
  
 diff --git a/daemon/cmd/daemon_main.go b/daemon/cmd/daemon_main.go
-index 9499317cce..0ba99bdb9b 100644
+index 2ec1d695ee..cdd0f62561 100644
 --- a/daemon/cmd/daemon_main.go
 +++ b/daemon/cmd/daemon_main.go
-@@ -935,6 +935,9 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
+@@ -826,6 +826,9 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
  	flags.Bool(option.EnableInClusterLoadBalance, false, "Enable k8s in cluster loadbalance")
  	option.BindEnv(vp, option.EnableInClusterLoadBalance)
  
@@ -45,25 +45,24 @@ index 9499317cce..0ba99bdb9b 100644
  		logging.Fatal(logger, "BindPFlags failed", logfields.Error, err)
  	}
 diff --git a/pkg/datapath/linux/config/config.go b/pkg/datapath/linux/config/config.go
-index 8b8332ad1c..84f93179cb 100644
+index 8d3db3d331..53fabb162c 100644
 --- a/pkg/datapath/linux/config/config.go
 +++ b/pkg/datapath/linux/config/config.go
-@@ -154,7 +154,9 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *datapath.LocalNodeC
- 			cDefinesMap["CILIUM_IPV4_FRAG_MAP_MAX_ENTRIES"] = fmt.Sprintf("%d", option.Config.FragmentsMapEntries)
- 		}
- 	}
--
+@@ -156,6 +156,9 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *config.Config) erro
+ 
+ 	cDefinesMap["CILIUM_IPV4_FRAG_MAP_MAX_ENTRIES"] = fmt.Sprintf("%d", option.Config.FragmentsMapEntries)
+ 
 +	if option.Config.DisablePerPacketLB {
 +		cDefinesMap["DISABLE_PER_PACKET_LB"] = "1"
 +	}
  	// --- WARNING: THIS CONFIGURATION METHOD IS DEPRECATED, SEE FUNCTION DOC ---
  
- 	cDefinesMap["UNKNOWN_ID"] = fmt.Sprintf("%d", identity.GetReservedID(labels.IDNameUnknown))
+ 	cDefinesMap["CILIUM_LB_SERVICE_MAP_MAX_ENTRIES"] = fmt.Sprintf("%d", cfg.LBConfig.LBServiceMapEntries)
 diff --git a/pkg/option/config.go b/pkg/option/config.go
-index eebe3fa191..2c11ff85c6 100644
+index ee90a70825..bbf7e1a7f6 100644
 --- a/pkg/option/config.go
 +++ b/pkg/option/config.go
-@@ -1066,6 +1066,7 @@ const (
+@@ -994,6 +994,7 @@ const (
  
  	// EnableInClusterLoadBalance enable short circuit for in cluster traffic to externalIP and loadBalancerIP
  	EnableInClusterLoadBalance = "enable-in-cluster-loadbalance"
@@ -71,7 +70,7 @@ index eebe3fa191..2c11ff85c6 100644
  )
  
  // Default string arguments
-@@ -2029,6 +2030,8 @@ type DaemonConfig struct {
+@@ -1893,6 +1894,8 @@ type DaemonConfig struct {
  
  	// EnableInClusterLoadBalance enable short circuit for in cluster traffic to externalIP and loadBalancerIP
  	EnableInClusterLoadBalance bool
@@ -80,8 +79,8 @@ index eebe3fa191..2c11ff85c6 100644
  }
  
  var (
-@@ -2742,6 +2745,7 @@ func (c *DaemonConfig) Populate(logger *slog.Logger, vp *viper.Viper) {
- 	c.BootIDFile = vp.GetString(BootIDFilename)
+@@ -2553,6 +2556,7 @@ func (c *DaemonConfig) Populate(logger *slog.Logger, vp *viper.Viper) {
+ 	c.IPTracingOptionType = vp.GetUint(IPTracingOptionType)
  
  	c.EnableInClusterLoadBalance = vp.GetBool(EnableInClusterLoadBalance)
 +	c.DisablePerPacketLB = vp.GetBool(DisablePerPacketLB)

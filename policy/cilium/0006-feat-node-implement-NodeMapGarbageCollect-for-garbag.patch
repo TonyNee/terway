@@ -1,4 +1,4 @@
-From 661ce8370051ac319f9f302f107f7ef9f3eefe96 Mon Sep 17 00:00:00 2001
+From 518d7df9985c94a7406ca4a32fc3d221d769f26d Mon Sep 17 00:00:00 2001
 From: l1b0k <libokang.lbk@alibaba-inc.com>
 Date: Mon, 9 Mar 2026 16:27:19 +0800
 Subject: [PATCH 06/11] feat(node): implement NodeMapGarbageCollect for garbage
@@ -7,10 +7,10 @@ Subject: [PATCH 06/11] feat(node): implement NodeMapGarbageCollect for garbage
 Signed-off-by: l1b0k <libokang.lbk@alibaba-inc.com>
 ---
  pkg/auth/authmap_gc.go                        |  5 ++
- pkg/datapath/fake/types/node_handler.go       |  3 +
  pkg/datapath/linux/node_ids.go                | 84 +++++++++++++++++++
- pkg/datapath/types/node.go                    |  7 ++
  pkg/hubble/peer/handler.go                    |  5 ++
+ pkg/node/fake/handler.go                      |  3 +
+ pkg/node/handler.go                           |  7 ++
  pkg/node/manager/manager.go                   | 42 ++++++++++
  pkg/node/manager/manager_test.go              |  3 +
  pkg/node/manager/rest_api.go                  |  3 +
@@ -19,10 +19,10 @@ Signed-off-by: l1b0k <libokang.lbk@alibaba-inc.com>
  10 files changed, 160 insertions(+)
 
 diff --git a/pkg/auth/authmap_gc.go b/pkg/auth/authmap_gc.go
-index 7f584cfb93..56f3b403f8 100644
+index 4e62b53d03..92f5f7b5dc 100644
 --- a/pkg/auth/authmap_gc.go
 +++ b/pkg/auth/authmap_gc.go
-@@ -147,6 +147,11 @@ func (r *authMapGarbageCollector) NodeValidateImplementation(node nodeTypes.Node
+@@ -149,6 +149,11 @@ func (r *authMapGarbageCollector) NodeValidateImplementation(node nodeTypes.Node
  	return nil
  }
  
@@ -34,25 +34,11 @@ index 7f584cfb93..56f3b403f8 100644
  func (r *authMapGarbageCollector) cleanupNodes(_ context.Context) error {
  	r.ciliumNodesMutex.Lock()
  	defer r.ciliumNodesMutex.Unlock()
-diff --git a/pkg/datapath/fake/types/node_handler.go b/pkg/datapath/fake/types/node_handler.go
-index ba57bcabb4..1c4926abe8 100644
---- a/pkg/datapath/fake/types/node_handler.go
-+++ b/pkg/datapath/fake/types/node_handler.go
-@@ -58,6 +58,9 @@ func (n *FakeNodeHandler) NodeValidateImplementation(node nodeTypes.Node) error
- 	return nil
- }
- 
-+func (n *FakeNodeHandler) NodeMapGarbageCollect(_ map[string]struct{}) {
-+}
-+
- func (n *FakeNodeHandler) GetNodeIP(_ uint16) string {
- 	return ""
- }
 diff --git a/pkg/datapath/linux/node_ids.go b/pkg/datapath/linux/node_ids.go
-index 86d97659fd..c1fc550cfb 100644
+index 1600087601..c6eca4d510 100644
 --- a/pkg/datapath/linux/node_ids.go
 +++ b/pkg/datapath/linux/node_ids.go
-@@ -340,6 +340,90 @@ func (n *linuxNodeHandler) RestoreNodeIDs() {
+@@ -351,6 +351,90 @@ func (n *linuxNodeHandler) RestoreNodeIDs() {
  		logfields.Count, len(nodeValues))
  }
  
@@ -143,26 +129,8 @@ index 86d97659fd..c1fc550cfb 100644
  func (n *linuxNodeHandler) registerNodeIDAllocations(allocatedNodeIDs map[string]*nodemap.NodeValueV2) {
  	n.mutex.Lock()
  	defer n.mutex.Unlock()
-diff --git a/pkg/datapath/types/node.go b/pkg/datapath/types/node.go
-index cd0b05a571..0346468a6a 100644
---- a/pkg/datapath/types/node.go
-+++ b/pkg/datapath/types/node.go
-@@ -237,6 +237,13 @@ type NodeHandler interface {
- 	// the node in the datapath. This function is intended to be run on an
- 	// interval to ensure that the datapath is consistently converged.
- 	NodeValidateImplementation(node nodeTypes.Node) error
-+
-+	// NodeMapGarbageCollect removes stale entries from the BPF node map
-+	// that don't correspond to any known node. validNodeIPs is the set of
-+	// all IP addresses belonging to nodes currently known to the node manager.
-+	// This is called after the initial node listing is complete (NodeSync)
-+	// to clean up entries that leaked due to missed node deletion events.
-+	NodeMapGarbageCollect(validNodeIPs map[string]struct{})
- }
- 
- type NodeConfigChangeHandler interface {
 diff --git a/pkg/hubble/peer/handler.go b/pkg/hubble/peer/handler.go
-index 61966f6545..d22785a24b 100644
+index 3504fcd064..067228e913 100644
 --- a/pkg/hubble/peer/handler.go
 +++ b/pkg/hubble/peer/handler.go
 @@ -112,6 +112,11 @@ func (h handler) NodeValidateImplementation(_ types.Node) error {
@@ -177,11 +145,43 @@ index 61966f6545..d22785a24b 100644
  // Close frees handler resources.
  func (h *handler) Close() {
  	close(h.stop)
+diff --git a/pkg/node/fake/handler.go b/pkg/node/fake/handler.go
+index 27187774b4..473f8b24fa 100644
+--- a/pkg/node/fake/handler.go
++++ b/pkg/node/fake/handler.go
+@@ -58,6 +58,9 @@ func (n *Handler) NodeValidateImplementation(node types.Node) error {
+ 	return nil
+ }
+ 
++func (n *Handler) NodeMapGarbageCollect(_ map[string]struct{}) {
++}
++
+ func (n *Handler) GetNodeIP(_ uint16) string {
+ 	return ""
+ }
+diff --git a/pkg/node/handler.go b/pkg/node/handler.go
+index 0b37edc80e..d4fe94a202 100644
+--- a/pkg/node/handler.go
++++ b/pkg/node/handler.go
+@@ -40,6 +40,13 @@ type Handler interface {
+ 	// the node in the datapath. This function is intended to be run on an
+ 	// interval to ensure that the datapath is consistently converged.
+ 	NodeValidateImplementation(node types.Node) error
++
++	// NodeMapGarbageCollect removes stale entries from the BPF node map
++	// that don't correspond to any known node. validNodeIPs is the set of
++	// all IP addresses belonging to nodes currently known to the node manager.
++	// This is called after the initial node listing is complete (NodeSync)
++	// to clean up entries that leaked due to missed node deletion events.
++	NodeMapGarbageCollect(validNodeIPs map[string]struct{})
+ }
+ 
+ type IDHandler interface {
 diff --git a/pkg/node/manager/manager.go b/pkg/node/manager/manager.go
-index 7a5c5be01f..a29a6f3605 100644
+index e7ee02ab3d..cabaf3db6e 100644
 --- a/pkg/node/manager/manager.go
 +++ b/pkg/node/manager/manager.go
-@@ -1193,6 +1193,9 @@ func (m *manager) pruneClusterNodes() {
+@@ -1196,6 +1196,9 @@ func (m *manager) pruneClusterNodes() {
  	m.mutex.Lock()
  	if len(m.restoredNodes) == 0 {
  		m.mutex.Unlock()
@@ -191,7 +191,7 @@ index 7a5c5be01f..a29a6f3605 100644
  		return
  	}
  	// Live nodes should not be pruned.
-@@ -1233,12 +1236,19 @@ func (m *manager) pruneClusterNodes() {
+@@ -1236,12 +1239,19 @@ func (m *manager) pruneClusterNodes() {
  		m.NodeDeleted(*n)
  		delete(m.restoredNodes, n.Identity())
  	}
@@ -211,7 +211,7 @@ index 7a5c5be01f..a29a6f3605 100644
  		return
  	}
  	// Live nodes should not be pruned.
-@@ -1279,6 +1289,38 @@ func (m *manager) pruneMeshedNodes() {
+@@ -1282,6 +1292,38 @@ func (m *manager) pruneMeshedNodes() {
  		m.NodeDeleted(*n)
  		delete(m.restoredNodes, n.Identity())
  	}
@@ -244,25 +244,25 @@ index 7a5c5be01f..a29a6f3605 100644
 +
 +	m.logger.Debug("Running node map garbage collection", logfields.Count, len(validNodeIPs))
 +
-+	m.Iter(func(nh datapath.NodeHandler) {
++	m.Iter(func(nh node.Handler) {
 +		nh.NodeMapGarbageCollect(validNodeIPs)
 +	})
  }
  
  // GetNodeIdentities returns a list of all node identities store in node
 diff --git a/pkg/node/manager/manager_test.go b/pkg/node/manager/manager_test.go
-index 46693f965f..bf2803d485 100644
+index 30bb51d1a0..35656c5b1e 100644
 --- a/pkg/node/manager/manager_test.go
 +++ b/pkg/node/manager/manager_test.go
-@@ -246,6 +246,9 @@ func (n *signalNodeHandler) NodeValidateImplementation(node nodeTypes.Node) erro
+@@ -242,6 +242,9 @@ func (n *signalNodeHandler) NodeValidateImplementation(node nodeTypes.Node) erro
  	return n.NodeValidateImplementationEventError
  }
  
 +func (n *signalNodeHandler) NodeMapGarbageCollect(_ map[string]struct{}) {
 +}
 +
- func setup(tb testing.TB) {
- 	node.SetTestLocalNodeStore()
+ func TestNodeLifecycle(t *testing.T) {
+ 	logger := hivetest.Logger(t)
  
 diff --git a/pkg/node/manager/rest_api.go b/pkg/node/manager/rest_api.go
 index ed561dc1b5..cbb7f423b1 100644
@@ -279,10 +279,10 @@ index ed561dc1b5..cbb7f423b1 100644
  	past := time.Now().Add(-clientGCTimeout)
  	for k, v := range h.clients {
 diff --git a/pkg/node/neighbordiscovery/node_neighbor_discovery.go b/pkg/node/neighbordiscovery/node_neighbor_discovery.go
-index 12bc4fe87f..f096276364 100644
+index 5093967d2f..4a9448fe63 100644
 --- a/pkg/node/neighbordiscovery/node_neighbor_discovery.go
 +++ b/pkg/node/neighbordiscovery/node_neighbor_discovery.go
-@@ -190,6 +190,11 @@ func (nnh *nodeNeighborHandler) NodeValidateImplementation(node nodeTypes.Node)
+@@ -191,6 +191,11 @@ func (nnh *nodeNeighborHandler) NodeValidateImplementation(node nodeTypes.Node)
  	return nnh.NodeAdd(node)
  }
  
@@ -293,9 +293,9 @@ index 12bc4fe87f..f096276364 100644
 +
  // NodeConfigurationChanged is called when the local node configuration
  // has changed
- func (nnh *nodeNeighborHandler) NodeConfigurationChanged(config datapath.LocalNodeConfiguration) error {
+ func (nnh *nodeNeighborHandler) NodeConfigurationChanged(config config.Config) error {
 diff --git a/pkg/wireguard/agent/node_handler.go b/pkg/wireguard/agent/node_handler.go
-index 2edcb1b401..6d16b27958 100644
+index 33e6e3ec81..d148e027a0 100644
 --- a/pkg/wireguard/agent/node_handler.go
 +++ b/pkg/wireguard/agent/node_handler.go
 @@ -41,6 +41,9 @@ func (a *Agent) NodeValidateImplementation(node nodeTypes.Node) error {

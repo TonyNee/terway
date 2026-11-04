@@ -1,4 +1,4 @@
-From 0c7b1eb5d0c72ab3475265f22ed8959b60962ff5 Mon Sep 17 00:00:00 2001
+From 6a1fd4c2af2f28586347d60d75956f320f2aafaa Mon Sep 17 00:00:00 2001
 From: l1b0k <libokang.lbk@alibaba-inc.com>
 Date: Wed, 13 May 2026 14:10:16 +0800
 Subject: [PATCH 07/11] feat(k8s): skip CRD register/wait for CPIP, CNC, CL2AP
@@ -26,10 +26,10 @@ Signed-off-by: l1b0k <libokang.lbk@alibaba-inc.com>
  2 files changed, 9 insertions(+), 17 deletions(-)
 
 diff --git a/pkg/k8s/apis/cilium.io/client/register.go b/pkg/k8s/apis/cilium.io/client/register.go
-index 0ec1f49f0f..d7d4385127 100644
+index 28a75df93c..f39426f821 100644
 --- a/pkg/k8s/apis/cilium.io/client/register.go
 +++ b/pkg/k8s/apis/cilium.io/client/register.go
-@@ -131,10 +131,8 @@ func CustomResourceDefinitionList() map[string]*CRDList {
+@@ -127,10 +127,8 @@ func CustomResourceDefinitionList() map[string]*CRDList {
  			Name:     CEGPCRDName,
  			FullName: k8sconstv2.CEGPName,
  		},
@@ -42,7 +42,7 @@ index 0ec1f49f0f..d7d4385127 100644
  		synced.CRDResourceName(k8sconstv2alpha1.CESName): {
  			Name:     CESCRDName,
  			FullName: k8sconstv2alpha1.CESName,
-@@ -179,14 +177,9 @@ func CustomResourceDefinitionList() map[string]*CRDList {
+@@ -171,14 +169,9 @@ func CustomResourceDefinitionList() map[string]*CRDList {
  			Name:     CCGCRDName,
  			FullName: k8sconstv2.CCGName,
  		},
@@ -61,23 +61,22 @@ index 0ec1f49f0f..d7d4385127 100644
  			Name:     CGCCCRDName,
  			FullName: k8sconstv2alpha1.CGCCName,
 diff --git a/pkg/k8s/synced/crd.go b/pkg/k8s/synced/crd.go
-index 6ba9f43810..430b548751 100644
+index 4e2ed39b6e..65ef938d26 100644
 --- a/pkg/k8s/synced/crd.go
 +++ b/pkg/k8s/synced/crd.go
-@@ -41,10 +41,10 @@ func CRDResourceName(crd string) string {
+@@ -41,9 +41,9 @@ func CRDResourceName(crd string) string {
  }
  
  func agentCRDResourceNames() []string {
 +	// terway: removed CPIPName (CiliumPodIPPool) — Terway owns IPAM, multi-pool unused.
  	result := []string{
- 		CRDResourceName(v2.CNName),
  		CRDResourceName(v2.CIDName),
 -		CRDResourceName(v2alpha1.CPIPName),
  	}
  
  	if !option.Config.DisableCiliumEndpointCRD {
-@@ -86,9 +86,9 @@ func agentCRDResourceNames() []string {
- 		result = append(result, CRDResourceName(v2.BGPNCOName))
+@@ -90,9 +90,9 @@ func agentCRDResourceNames() []string {
+ 		result = append(result, CRDResourceName(v2alpha1.CDPPName))
  	}
  
 +	// terway: removed L2AnnouncementName — service VIPs are handled by Aliyun SLB.
@@ -87,7 +86,7 @@ index 6ba9f43810..430b548751 100644
  	)
  
  	return result
-@@ -123,10 +123,9 @@ func GatewayAPIResourceNames() []string {
+@@ -127,10 +127,9 @@ func GatewayAPIResourceNames() []string {
  // AllCiliumCRDResourceNames returns a list of all Cilium CRD resource names
  // that the cilium operator or testsuite may register.
  func AllCiliumCRDResourceNames() []string {

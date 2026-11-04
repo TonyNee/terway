@@ -1,49 +1,50 @@
-From 752212cae62b5ad6808fce9e79776e21f8eaf7a3 Mon Sep 17 00:00:00 2001
+From 8e1e177dab7a34889ac6708c80dff70be9056905 Mon Sep 17 00:00:00 2001
 From: l1b0k <libokang.lbk@alibaba-inc.com>
 Date: Thu, 13 Nov 2025 15:02:38 +0800
 Subject: [PATCH 02/11] lb: enable in cluster load balancer
 
 Signed-off-by: l1b0k <libokang.lbk@alibaba-inc.com>
 ---
- bpf/bpf_lxc.c                              | 4 ++--
- daemon/cmd/daemon_main.go                  | 3 +++
- daemon/cmd/kube_proxy_replacement.go       | 4 +---
- pkg/client/client.go                       | 3 +++
- pkg/loadbalancer/config.go                 | 3 +++
- pkg/loadbalancer/reflectors/conversions.go | 2 ++
- pkg/option/config.go                       | 8 ++++++++
- pkg/status/status_collector.go             | 2 +-
- 8 files changed, 23 insertions(+), 6 deletions(-)
+ bpf/bpf_lxc.c                                 |   4 +-
+ daemon/cmd/daemon_main.go                     |   3 +
+ pkg/client/client.go                          |   3 +
+ pkg/kpr/initializer/kube_proxy_replacement.go |   4 +-
+ pkg/loadbalancer/config.go                    |   4 +
+ pkg/loadbalancer/reconciler/bpf_reconciler.go |   2 +
+ pkg/loadbalancer/reflectors/conversions.go    | 117 +++++++++---------
+ pkg/option/config.go                          |   9 ++
+ pkg/status/status_collector.go                |   3 +
+ 9 files changed, 89 insertions(+), 60 deletions(-)
 
 diff --git a/bpf/bpf_lxc.c b/bpf/bpf_lxc.c
-index ace5fd819a..eb6491d891 100644
+index 34920881b0..b5b24bb6f8 100644
 --- a/bpf/bpf_lxc.c
 +++ b/bpf/bpf_lxc.c
-@@ -99,7 +99,7 @@ static __always_inline int __per_packet_lb_svc_xlate_4(void *ctx, struct iphdr *
+@@ -170,7 +170,7 @@ static __always_inline int __per_packet_lb_svc_xlate_4(void *ctx, struct iphdr *
  
  	lb4_fill_key(&key, &tuple);
  
 -	svc = lb4_lookup_service(&key, is_defined(ENABLE_NODEPORT));
 +	svc = lb4_lookup_service(&key, true);
- 	if (svc) {
- #if defined(ENABLE_L7_LB)
- 		if (lb4_svc_is_l7_loadbalancer(svc)) {
-@@ -173,7 +173,7 @@ static __always_inline int __per_packet_lb_svc_xlate_6(void *ctx, struct ipv6hdr
+ 
+ #if defined(ENABLE_NODEPORT)
+ 	{
+@@ -349,7 +349,7 @@ static __always_inline int __per_packet_lb_svc_xlate_6(void *ctx, struct ipv6hdr
  	 * the CT entry for destination endpoints where we can't encode the
  	 * state in the address.
  	 */
 -	svc = lb6_lookup_service(&key, is_defined(ENABLE_NODEPORT));
 +	svc = lb6_lookup_service(&key, true);
- 	if (svc) {
- #if defined(ENABLE_L7_LB)
- 		if (lb6_svc_is_l7_loadbalancer(svc)) {
+ 
+ #if defined(ENABLE_NODEPORT)
+ 	{
 diff --git a/daemon/cmd/daemon_main.go b/daemon/cmd/daemon_main.go
-index 2c12bc4252..9499317cce 100644
+index 33c41bf082..2ec1d695ee 100644
 --- a/daemon/cmd/daemon_main.go
 +++ b/daemon/cmd/daemon_main.go
-@@ -932,6 +932,9 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
- 	flags.Float64(option.ConnectivityProbeFrequencyRatio, defaults.ConnectivityProbeFrequencyRatio, "Ratio of the connectivity probe frequency vs resource usage, a float in [0, 1]. 0 will give more frequent probing, 1 will give less frequent probing. Probing frequency is dynamically adjusted based on the cluster size.")
- 	option.BindEnv(vp, option.ConnectivityProbeFrequencyRatio)
+@@ -823,6 +823,9 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
+ 	flags.MarkHidden(option.EnableDatapathPlugins)
+ 	option.BindEnv(vp, option.EnableDatapathPlugins)
  
 +	flags.Bool(option.EnableInClusterLoadBalance, false, "Enable k8s in cluster loadbalance")
 +	option.BindEnv(vp, option.EnableInClusterLoadBalance)
@@ -51,33 +52,11 @@ index 2c12bc4252..9499317cce 100644
  	if err := vp.BindPFlags(flags); err != nil {
  		logging.Fatal(logger, "BindPFlags failed", logfields.Error, err)
  	}
-diff --git a/daemon/cmd/kube_proxy_replacement.go b/daemon/cmd/kube_proxy_replacement.go
-index b1f8ca0b60..e16157f3dc 100644
---- a/daemon/cmd/kube_proxy_replacement.go
-+++ b/daemon/cmd/kube_proxy_replacement.go
-@@ -42,9 +42,6 @@ import (
- // if this function cannot determine the strictness an error is returned and the boolean
- // is false. If an error is returned the boolean is of no meaning.
- func initKubeProxyReplacementOptions(logger *slog.Logger, sysctl sysctl.Sysctl, tunnelConfig tunnel.Config, lbConfig loadbalancer.Config, kprCfg kpr.KPRConfig) error {
--	if !kprCfg.EnableNodePort {
--		option.Config.EnableHostLegacyRouting = true
--	}
- 	logger.Info("kube-proxy replacement starting with the following config",
- 		logfields.KPRConfiguration, kprCfg)
- 
-@@ -260,6 +257,7 @@ func probeKubeProxyReplacementOptions(logger *slog.Logger, lbConfig loadbalancer
- // finishKubeProxyReplacementInit finishes initialization of kube-proxy
- // replacement after all devices are known.
- func finishKubeProxyReplacementInit(logger *slog.Logger, sysctl sysctl.Sysctl, devices []*tables.Device, directRoutingDevice string, lbConfig loadbalancer.Config, kprCfg kpr.KPRConfig) error {
-+	return nil
- 	// For MKE, we only need to change/extend the socket LB behavior in case
- 	// of kube-proxy replacement. Otherwise, nothing else is needed.
- 	if option.Config.EnableMKE && kprCfg.EnableSocketLB {
 diff --git a/pkg/client/client.go b/pkg/client/client.go
-index fcaafc7241..86f6655209 100644
+index 32e289081c..c577741a90 100644
 --- a/pkg/client/client.go
 +++ b/pkg/client/client.go
-@@ -690,6 +690,9 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
+@@ -709,6 +709,9 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
  			nPort = fmt.Sprintf("Enabled (Range: %d-%d)", np.PortMin, np.PortMax)
  			lb = "Enabled"
  		}
@@ -87,84 +66,254 @@ index fcaafc7241..86f6655209 100644
  
  		affinity := "Disabled"
  		if sr.KubeProxyReplacement.Features.SessionAffinity.Enabled {
+diff --git a/pkg/kpr/initializer/kube_proxy_replacement.go b/pkg/kpr/initializer/kube_proxy_replacement.go
+index 4a81880723..fab10a948a 100644
+--- a/pkg/kpr/initializer/kube_proxy_replacement.go
++++ b/pkg/kpr/initializer/kube_proxy_replacement.go
+@@ -43,7 +43,8 @@ type kprInitializer struct {
+ }
+ 
+ func (r *kprInitializer) InitKubeProxyReplacementOptions() error {
+-	if !option.Config.UnsafeDaemonConfigOption.EnableHostLegacyRouting {
++	// Terway: this fallback was skipped by the early return in FinishKubeProxyReplacementInit.
++	if false && !option.Config.UnsafeDaemonConfigOption.EnableHostLegacyRouting {
+ 		msg := ""
+ 		switch {
+ 		// Non-BPF masquerade requires netfilter and hence CT.
+@@ -257,6 +258,7 @@ func probeKubeProxyReplacementOptions(logger *slog.Logger, lbConfig loadbalancer
+ }
+ 
+ func (r *kprInitializer) FinishKubeProxyReplacementInit(devices []*tables.Device, directRoutingDevice string) error {
++	return nil
+ 	// For MKE, we only need to change/extend the socket LB behavior in case
+ 	// of kube-proxy replacement. Otherwise, nothing else is needed.
+ 	if option.Config.EnableMKE && r.kprCfg.EnableSocketLB {
 diff --git a/pkg/loadbalancer/config.go b/pkg/loadbalancer/config.go
-index 47d512e4de..9a65510b3e 100644
+index 46e222ed7b..d3a31893b1 100644
 --- a/pkg/loadbalancer/config.go
 +++ b/pkg/loadbalancer/config.go
-@@ -523,6 +523,8 @@ type ExternalConfig struct {
- 	EnableSocketLBPodConnectionTermination bool
- 	EnableHealthCheckLoadBalancerIP        bool
- 
-+	EnableInClusterLoadBalance bool
+@@ -549,6 +549,8 @@ type ExternalConfig struct {
+ 	DefaultLBServiceIPAM                   string
+ 	EnableLBIPAM                           bool
+ 	EnableNodeIPAM                         bool
 +
- 	// The following options will be removed in v1.19
- 	EnableHostPort              bool
- 	EnableSessionAffinity       bool
-@@ -537,6 +539,7 @@ func NewExternalConfig(cfg *option.DaemonConfig, kprCfg kpr.KPRConfig) ExternalC
- 		EnableIPv4:                             cfg.EnableIPv4,
- 		EnableIPv6:                             cfg.EnableIPv6,
- 		KubeProxyReplacement:                   kprCfg.KubeProxyReplacement == option.KubeProxyReplacementTrue || kprCfg.EnableNodePort,
-+		EnableInClusterLoadBalance:             cfg.EnableInClusterLoadBalance,
- 		BPFSocketLBHostnsOnly:                  cfg.BPFSocketLBHostnsOnly,
- 		EnableSocketLB:                         kprCfg.EnableSocketLB,
- 		EnableSocketLBPodConnectionTermination: cfg.EnableSocketLBPodConnectionTermination,
++	EnableInClusterLoadBalance bool
+ }
+ 
+ type externalConfigParams struct {
+@@ -573,6 +575,8 @@ func NewExternalConfig(p externalConfigParams) ExternalConfig {
+ 		DefaultLBServiceIPAM:                   p.LBIPAMConfig.GetDefaultLBServiceIPAM(),
+ 		EnableLBIPAM:                           p.LBIPAMConfig.IsEnabled(),
+ 		EnableNodeIPAM:                         p.NodeIPAMConfig.IsEnabled(),
++
++		EnableInClusterLoadBalance: p.DaemonConfig.EnableInClusterLoadBalance,
+ 	}
+ }
+ 
+diff --git a/pkg/loadbalancer/reconciler/bpf_reconciler.go b/pkg/loadbalancer/reconciler/bpf_reconciler.go
+index e2a4fc7d7d..e5a44b2588 100644
+--- a/pkg/loadbalancer/reconciler/bpf_reconciler.go
++++ b/pkg/loadbalancer/reconciler/bpf_reconciler.go
+@@ -1252,6 +1252,8 @@ func (ops *BPFOps) isDatapathCandidate(fe *loadbalancer.Frontend) bool {
+ 
+ 	// If KPR is off, it depends on the Frontend type.
+ 	switch fe.Type {
++	case loadbalancer.SVCTypeLoadBalancer:
++		return ops.extCfg.EnableInClusterLoadBalance
+ 	case loadbalancer.SVCTypeClusterIP, loadbalancer.SVCTypeLocalRedirect,
+ 		loadbalancer.SVCTypeExternalIPs:
+ 		// We should always program ClusterIP and LocalRedirect, as well as
 diff --git a/pkg/loadbalancer/reflectors/conversions.go b/pkg/loadbalancer/reflectors/conversions.go
-index 65e3e71c28..03cc2cea3c 100644
+index f96c217305..36b683602f 100644
 --- a/pkg/loadbalancer/reflectors/conversions.go
 +++ b/pkg/loadbalancer/reflectors/conversions.go
-@@ -277,7 +277,9 @@ func convertService(cfg loadbalancer.Config, extCfg loadbalancer.ExternalConfig,
- 				}
- 			}
+@@ -274,21 +274,60 @@ func convertService(cfg loadbalancer.Config, extCfg loadbalancer.ExternalConfig,
  		}
-+	}
+ 	}
  
+-	// LoadBalancer
+-	if svc.Spec.Type == slim_corev1.ServiceTypeLoadBalancer && expType.CanExpose(slim_corev1.ServiceTypeLoadBalancer) {
+-		for _, ip := range svc.Status.LoadBalancer.Ingress {
+-			if ip.IP == "" ||
+-				(ip.IPMode != nil && *ip.IPMode != slim_corev1.LoadBalancerIPModeVIP) /* KEP-1860, skip non-VIP */ {
+-				continue
 +	if extCfg.KubeProxyReplacement || extCfg.EnableInClusterLoadBalance {
- 		// LoadBalancer
- 		if svc.Spec.Type == slim_corev1.ServiceTypeLoadBalancer && expType.CanExpose(slim_corev1.ServiceTypeLoadBalancer) {
- 			for _, ip := range svc.Status.LoadBalancer.Ingress {
++		// LoadBalancer
++		if svc.Spec.Type == slim_corev1.ServiceTypeLoadBalancer && expType.CanExpose(slim_corev1.ServiceTypeLoadBalancer) {
++			for _, ip := range svc.Status.LoadBalancer.Ingress {
++				if ip.IP == "" ||
++					(ip.IPMode != nil && *ip.IPMode != slim_corev1.LoadBalancerIPModeVIP) /* KEP-1860, skip non-VIP */ {
++					continue
++				}
++
++				addr, err := cmtypes.ParseAddrCluster(ip.IP)
++				if err != nil {
++					continue
++				}
++				if (!extCfg.EnableIPv6 && addr.Is6()) || (!extCfg.EnableIPv4 && addr.Is4()) {
++					log().Debug(
++						"Skipping LoadBalancer due to disabled IP family",
++						logfields.IPv4, extCfg.EnableIPv4,
++						logfields.IPv6, extCfg.EnableIPv6,
++						logfields.Address, addr,
++					)
++					continue
++				}
++
++				for _, scope := range scopes {
++					for _, port := range svc.Spec.Ports {
++						fe := loadbalancer.FrontendParams{
++							Type:        loadbalancer.SVCTypeLoadBalancer,
++							PortName:    loadbalancer.FEPortName(cache.Strings.Get(port.Name)),
++							ServiceName: name,
++							ServicePort: uint16(port.Port),
++						}
++
++						fe.Address = loadbalancer.NewL3n4Addr(
++							loadbalancer.L4Type(port.Protocol),
++							addr,
++							uint16(port.Port),
++							scope,
++						)
++						fes = append(fes, fe)
++					}
++				}
++
+ 			}
++		}
+ 
+-			addr, err := cmtypes.ParseAddrCluster(ip.IP)
++		// ExternalIP
++		for _, ip := range svc.Spec.ExternalIPs {
++			addr, err := cmtypes.ParseAddrCluster(ip)
+ 			if err != nil {
+ 				continue
+ 			}
+ 			if (!extCfg.EnableIPv6 && addr.Is6()) || (!extCfg.EnableIPv4 && addr.Is4()) {
+ 				log().Debug(
+-					"Skipping LoadBalancer due to disabled IP family",
++					"Skipping ExternalIP due to disabled IP family",
+ 					logfields.IPv4, extCfg.EnableIPv4,
+ 					logfields.IPv6, extCfg.EnableIPv6,
+ 					logfields.Address, addr,
+@@ -296,59 +335,23 @@ func convertService(cfg loadbalancer.Config, extCfg loadbalancer.ExternalConfig,
+ 				continue
+ 			}
+ 
+-			for _, scope := range scopes {
+-				for _, port := range svc.Spec.Ports {
+-					fe := loadbalancer.FrontendParams{
+-						Type:        loadbalancer.SVCTypeLoadBalancer,
+-						PortName:    loadbalancer.FEPortName(cache.Strings.Get(port.Name)),
+-						ServiceName: name,
+-						ServicePort: uint16(port.Port),
+-					}
+-
+-					fe.Address = loadbalancer.NewL3n4Addr(
+-						loadbalancer.L4Type(port.Protocol),
+-						addr,
+-						uint16(port.Port),
+-						scope,
+-					)
+-					fes = append(fes, fe)
++			for _, port := range svc.Spec.Ports {
++				fe := loadbalancer.FrontendParams{
++					Type:        loadbalancer.SVCTypeExternalIPs,
++					PortName:    loadbalancer.FEPortName(cache.Strings.Get(port.Name)),
++					ServiceName: name,
++					ServicePort: uint16(port.Port),
+ 				}
++				fe.Address = loadbalancer.NewL3n4Addr(
++					loadbalancer.L4Type(port.Protocol),
++					addr,
++					uint16(port.Port),
++					loadbalancer.ScopeExternal,
++				)
++				fes = append(fes, fe)
+ 			}
+-
+ 		}
+-	}
+ 
+-	// ExternalIP
+-	for _, ip := range svc.Spec.ExternalIPs {
+-		addr, err := cmtypes.ParseAddrCluster(ip)
+-		if err != nil {
+-			continue
+-		}
+-		if (!extCfg.EnableIPv6 && addr.Is6()) || (!extCfg.EnableIPv4 && addr.Is4()) {
+-			log().Debug(
+-				"Skipping ExternalIP due to disabled IP family",
+-				logfields.IPv4, extCfg.EnableIPv4,
+-				logfields.IPv6, extCfg.EnableIPv6,
+-				logfields.Address, addr,
+-			)
+-			continue
+-		}
+-
+-		for _, port := range svc.Spec.Ports {
+-			fe := loadbalancer.FrontendParams{
+-				Type:        loadbalancer.SVCTypeExternalIPs,
+-				PortName:    loadbalancer.FEPortName(cache.Strings.Get(port.Name)),
+-				ServiceName: name,
+-				ServicePort: uint16(port.Port),
+-			}
+-			fe.Address = loadbalancer.NewL3n4Addr(
+-				loadbalancer.L4Type(port.Protocol),
+-				addr,
+-				uint16(port.Port),
+-				loadbalancer.ScopeExternal,
+-			)
+-			fes = append(fes, fe)
+-		}
+ 	}
+ 
+ 	return
 diff --git a/pkg/option/config.go b/pkg/option/config.go
-index 8223206498..eebe3fa191 100644
+index 2bc67f2904..ee90a70825 100644
 --- a/pkg/option/config.go
 +++ b/pkg/option/config.go
-@@ -1063,6 +1063,9 @@ const (
+@@ -991,6 +991,9 @@ const (
  
- 	// ConnectivityProbeFrequencyRatio is the name of the option to specify the connectivity probe frequency
- 	ConnectivityProbeFrequencyRatio = "connectivity-probe-frequency-ratio"
+ 	// EnableDatapathPlugins is the name of the option to enable datapath plugins.
+ 	EnableDatapathPlugins = "enable-datapath-plugins"
 +
 +	// EnableInClusterLoadBalance enable short circuit for in cluster traffic to externalIP and loadBalancerIP
 +	EnableInClusterLoadBalance = "enable-in-cluster-loadbalance"
  )
  
  // Default string arguments
-@@ -2023,6 +2026,9 @@ type DaemonConfig struct {
+@@ -1887,6 +1890,9 @@ type DaemonConfig struct {
  
- 	// ConnectivityProbeFrequencyRatio is the ratio of the connectivity probe frequency vs resource consumption
- 	ConnectivityProbeFrequencyRatio float64
+ 	// Enables datapath plugins features.
+ 	EnableDatapathPlugins bool
 +
 +	// EnableInClusterLoadBalance enable short circuit for in cluster traffic to externalIP and loadBalancerIP
 +	EnableInClusterLoadBalance bool
  }
  
  var (
-@@ -2735,6 +2741,8 @@ func (c *DaemonConfig) Populate(logger *slog.Logger, vp *viper.Viper) {
- 	c.EnableIPSecEncryptedOverlay = vp.GetBool(EnableIPSecEncryptedOverlay)
+@@ -2545,6 +2551,9 @@ func (c *DaemonConfig) Populate(logger *slog.Logger, vp *viper.Viper) {
  	c.BootIDFile = vp.GetString(BootIDFilename)
- 
+ 	c.EnableExtendedIPProtocols = vp.GetBool(EnableExtendedIPProtocols)
+ 	c.IPTracingOptionType = vp.GetUint(IPTracingOptionType)
++
 +	c.EnableInClusterLoadBalance = vp.GetBool(EnableInClusterLoadBalance)
 +
  	c.ServiceNoBackendResponse = vp.GetString(ServiceNoBackendResponse)
  	switch c.ServiceNoBackendResponse {
  	case ServiceNoBackendResponseReject, ServiceNoBackendResponseDrop:
 diff --git a/pkg/status/status_collector.go b/pkg/status/status_collector.go
-index 3c5008e944..2db7821035 100644
+index 15d28c2c98..3a5258fac5 100644
 --- a/pkg/status/status_collector.go
 +++ b/pkg/status/status_collector.go
-@@ -340,7 +340,7 @@ func (d *statusCollector) getKubeProxyReplacementStatus(ctx context.Context) *mo
- 	if d.statusParams.KPRConfig.EnableHostPort {
- 		features.HostPort.Enabled = true
+@@ -348,6 +348,9 @@ func (d *statusCollector) getKubeProxyReplacementStatus(ctx context.Context) *mo
  	}
--	if d.statusParams.KPRConfig.EnableExternalIPs {
-+	if d.statusParams.KPRConfig.EnableExternalIPs || d.statusParams.DaemonConfig.EnableInClusterLoadBalance {
+ 	if d.statusParams.KPRConfig.KubeProxyReplacement {
+ 		features.HostPort.Enabled = true
++	}
++	if d.statusParams.KPRConfig.KubeProxyReplacement ||
++		d.statusParams.DaemonConfig.EnableInClusterLoadBalance {
  		features.ExternalIPs.Enabled = true
  	}
  	if d.statusParams.KPRConfig.EnableSocketLB {
