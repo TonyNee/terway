@@ -1,0 +1,505 @@
+From 22d03d9e5cfb58db53ee63d610f42e993b16d710 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=99=B6=E5=B0=BC?= <taoni.nt@alibaba-inc.com>
+Date: Mon, 23 Nov 2026 16:50:32 +0800
+Subject: [PATCH 15/16] feat(terway): handle trunk VLAN ingress with a datapath
+ plugin
+
+---
+ bpf/bpf_terway.c                              |  24 ++-
+ bpf/lib/terway.h                              |  93 ++++++++
+ bpf/test-progs/bpf_terway_base.c              |  48 +++++
+ pkg/datapath/loader/terway.go                 |  32 ++-
+ pkg/datapath/loader/terway_privileged_test.go | 204 ++++++++++++++++++
+ pkg/terway/binding.go                         |   2 +-
+ 6 files changed, 399 insertions(+), 4 deletions(-)
+ create mode 100644 bpf/lib/terway.h
+ create mode 100644 bpf/test-progs/bpf_terway_base.c
+ create mode 100644 pkg/datapath/loader/terway_privileged_test.go
+
+diff --git a/bpf/bpf_terway.c b/bpf/bpf_terway.c
+index ed5773f87f..da30d1c997 100644
+--- a/bpf/bpf_terway.c
++++ b/bpf/bpf_terway.c
+@@ -3,11 +3,33 @@
+ 
+ #include <bpf/ctx/skb.h>
+ #include <bpf/section.h>
++#include "lib/terway.h"
+ 
+ /* -1 means continue the datapath plugin dispatcher, not TC_ACT_OK. */
+ __section("freplace")
+-int terway_ingress(struct __ctx_buff *ctx __maybe_unused)
++int terway_ingress(struct __ctx_buff *ctx)
+ {
++	__u16 proto;
++
++	if (!terway_managed_parent(ctx->ifindex))
++		return -1;
++	terway_count(TERWAY_HOOK_RUN);
++	if (skb_load_bytes(ctx, 12, &proto, sizeof(proto)) < 0)
++		return terway_drop(TERWAY_DROP_INVALID);
++	if (proto == bpf_htons(0x88a8))
++		return terway_drop(TERWAY_DROP_INVALID);
++	if (!ctx->vlan_present && proto != bpf_htons(0x8100))
++		return -1;
++	/* The hypervisor owns ingress VLAN classification, just as for the legacy
++	 * TC VLAN pop rule. Do not remove service, policy, or routing processing.
++	 */
++	if (skb_vlan_pop(ctx) < 0)
++		return terway_drop(TERWAY_DROP_POP);
++	if (skb_load_bytes(ctx, 12, &proto, sizeof(proto)) < 0 ||
++	    ctx->vlan_present || proto == bpf_htons(0x8100) ||
++	    proto == bpf_htons(0x88a8))
++		return terway_drop(TERWAY_DROP_INVALID);
++	terway_count(TERWAY_INGRESS_POP);
+ 	return -1;
+ }
+ 
+diff --git a/bpf/lib/terway.h b/bpf/lib/terway.h
+new file mode 100644
+index 0000000000..a9fccd0d56
+--- /dev/null
++++ b/bpf/lib/terway.h
+@@ -0,0 +1,93 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/* Copyright Authors of Cilium */
++
++#pragma once
++
++#include <bpf/ctx/skb.h>
++#include <bpf/section.h>
++#include <bpf/api.h>
++#include "endian.h"
++
++static long BPF_FUNC(skb_vlan_pop, struct __sk_buff *ctx);
++static long BPF_FUNC(skb_vlan_push, struct __sk_buff *ctx, __be16 proto, __u16 vlan);
++
++enum terway_key_kind {
++	TERWAY_PARENT = 0,
++	TERWAY_LINK = 1,
++	TERWAY_IPV4 = 4,
++	TERWAY_IPV6 = 6,
++};
++
++struct terway_key {
++	__u32 ifindex;
++	__u32 kind;
++	__u8 address[16];
++};
++
++struct terway_value {
++	__u32 parent;
++	__u32 owner;
++	__u16 vlan;
++	__u16 pad;
++	__u8 mac[6];
++	__u16 pad2;
++};
++
++struct {
++	__uint(type, BPF_MAP_TYPE_HASH);
++	__type(key, struct terway_key);
++	__type(value, struct terway_value);
++	__uint(max_entries, 262144);
++	__uint(map_flags, BPF_F_RDONLY_PROG);
++} cilium_twvlan __section_maps_btf;
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
++	__type(key, __u32);
++	__type(value, __u64);
++	__uint(max_entries, 8);
++} cilium_twstats __section_maps_btf;
++
++enum terway_stat {
++	TERWAY_INGRESS_POP,
++	TERWAY_EGRESS_PUSH,
++	TERWAY_DROP_INVALID,
++	TERWAY_DROP_POP,
++	TERWAY_DROP_PUSH,
++	TERWAY_DROP_BINDING,
++	TERWAY_NORMALIZE_PIPE,
++	TERWAY_HOOK_RUN,
++};
++
++static __always_inline void terway_count(__u32 reason)
++{
++	__u64 *counter = map_lookup_elem(&cilium_twstats, &reason);
++
++	if (counter)
++		(*counter)++;
++}
++
++/* Bound by the loader to the actual device's MAC. This prevents restored
++ * state for a recycled ifindex from claiming an unrelated new interface.
++ */
++const volatile __u8 terway_parent_mac[6];
++
++static __always_inline bool terway_managed_parent(__u32 ifindex)
++{
++	struct terway_key key = { .ifindex = ifindex, .kind = TERWAY_PARENT };
++	const struct terway_value *parent = map_lookup_elem(&cilium_twvlan, &key);
++
++	if (!parent)
++		return false;
++#pragma unroll
++	for (int i = 0; i < 6; i++)
++		if (parent->mac[i] != terway_parent_mac[i])
++			return false;
++	return true;
++}
++
++static __always_inline int terway_drop(__u32 reason)
++{
++	terway_count(reason);
++	return CTX_ACT_DROP;
++}
+diff --git a/bpf/test-progs/bpf_terway_base.c b/bpf/test-progs/bpf_terway_base.c
+new file mode 100644
+index 0000000000..f501ecf05d
+--- /dev/null
++++ b/bpf/test-progs/bpf_terway_base.c
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/* Copyright Authors of Cilium */
++
++#include <bpf/ctx/skb.h>
++#include <bpf/api.h>
++
++const volatile __u32 test_verdict;
++const volatile __u32 test_nat_source;
++
++__section_entry
++int cil_from_netdev(struct __ctx_buff *ctx __maybe_unused)
++{
++	return test_verdict;
++}
++
++__section_entry
++int cil_to_netdev(struct __ctx_buff *ctx)
++{
++	if (test_nat_source) {
++		__u32 source = test_nat_source;
++
++		if (skb_store_bytes(ctx, 26, &source, sizeof(source), 0) < 0)
++			return CTX_ACT_DROP;
++	}
++	return test_verdict;
++}
++
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__type(key, __u32);
++	__uint(value_size, 16);
++	__uint(max_entries, 1);
++} tw_observe __section_maps_btf;
++
++/* A second POST plugin observes the skb after the Terway hook. This tests
++ * actual kernel VLAN metadata, not just a userspace model of the algorithm.
++ */
++__section("freplace")
++int terway_observe(struct __ctx_buff *ctx, int ret)
++{
++	__u32 zero = 0;
++	__u32 result[4] = { ctx->vlan_present, ctx->vlan_tci, ret, ctx->protocol };
++
++	map_update_elem(&tw_observe, &zero, result, 0);
++	return -1;
++}
++
++BPF_LICENSE("Dual BSD/GPL");
+diff --git a/pkg/datapath/loader/terway.go b/pkg/datapath/loader/terway.go
+index fc67911471..a007659810 100644
+--- a/pkg/datapath/loader/terway.go
++++ b/pkg/datapath/loader/terway.go
+@@ -16,9 +16,12 @@ import (
+ 	"google.golang.org/grpc"
+ 
+ 	"github.com/cilium/cilium/api/v1/datapathplugins"
++	"github.com/cilium/cilium/pkg/bpf"
+ 	plugin "github.com/cilium/cilium/pkg/datapath/plugins/types"
+ 	api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
++	"github.com/cilium/cilium/pkg/maps/terwaymap"
+ 	"github.com/cilium/cilium/pkg/option"
++	"github.com/vishvananda/netlink"
+ )
+ 
+ type terwayPluginOut struct {
+@@ -42,7 +45,7 @@ type terwayPlugin struct {
+ 	spec   *ebpf.CollectionSpec
+ }
+ 
+-func (*terwayPlugin) Name() string { return "terway-vlan" }
++func (*terwayPlugin) Name() string { return "terway_vlan" }
+ func (*terwayPlugin) AttachmentPolicy() api_v2alpha1.CiliumDatapathPluginAttachmentPolicy {
+ 	return api_v2alpha1.AttachmentPolicyAlways
+ }
+@@ -92,11 +95,21 @@ func (p *terwayPlugin) collectionSpec(ctx context.Context) (*ebpf.CollectionSpec
+ }
+ 
+ func (p *terwayPlugin) InstrumentCollection(ctx context.Context, req *datapathplugins.InstrumentCollectionRequest, _ ...grpc.CallOption) (*datapathplugins.InstrumentCollectionResponse, error) {
++	iface := req.GetAttachmentContext().GetHost().GetIface().GetName()
++	device, err := netlink.LinkByName(iface)
++	if err != nil {
++		return nil, fmt.Errorf("resolve Terway attachment device: %w", err)
++	}
++	var parentMAC [6]byte
++	copy(parentMAC[:], device.Attrs().HardwareAddr)
+ 	for _, hook := range req.GetHooks() {
+ 		spec, err := p.collectionSpec(ctx)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("compile Terway datapath: %w", err)
+ 		}
++		if err := spec.Variables["terway_parent_mac"].Set(parentMAC); err != nil {
++			return nil, err
++		}
+ 		name := "terway_ingress"
+ 		if hook.GetType() == datapathplugins.HookType_POST {
+ 			name = "terway_egress"
+@@ -112,7 +125,22 @@ func (p *terwayPlugin) InstrumentCollection(ctx context.Context, req *datapathpl
+ 		prog.AttachTarget = target
+ 		prog.AttachTo = hook.GetAttachTarget().GetSubprogName()
+ 		spec.Programs = map[string]*ebpf.ProgramSpec{name: prog}
+-		coll, err := ebpf.NewCollection(spec)
++		replacements := map[string]*ebpf.Map{}
++		for _, mapName := range []string{terwaymap.MapName, terwaymap.StatsMapName} {
++			m, err := ebpf.LoadPinnedMap(bpf.MapPath(p.logger, mapName), nil)
++			if err != nil {
++				target.Close()
++				for _, opened := range replacements {
++					opened.Close()
++				}
++				return nil, err
++			}
++			replacements[mapName] = m
++		}
++		coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{MapReplacements: replacements})
++		for _, opened := range replacements {
++			opened.Close()
++		}
+ 		target.Close()
+ 		if err != nil {
+ 			return nil, fmt.Errorf("load Terway hook %s: %w", name, err)
+diff --git a/pkg/datapath/loader/terway_privileged_test.go b/pkg/datapath/loader/terway_privileged_test.go
+new file mode 100644
+index 0000000000..d5fe8d5dba
+--- /dev/null
++++ b/pkg/datapath/loader/terway_privileged_test.go
+@@ -0,0 +1,204 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++package loader
++
++import (
++	"context"
++	"encoding/binary"
++	"fmt"
++	"net"
++	"net/netip"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/cilium/ebpf"
++	"github.com/cilium/ebpf/rlimit"
++	"github.com/cilium/hive/hivetest"
++	"github.com/stretchr/testify/require"
++	"github.com/vishvananda/netlink"
++	"google.golang.org/grpc"
++
++	"github.com/cilium/cilium/api/v1/datapathplugins"
++	"github.com/cilium/cilium/pkg/bpf"
++	"github.com/cilium/cilium/pkg/datapath/config"
++	plugin "github.com/cilium/cilium/pkg/datapath/plugins/types"
++	api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
++	"github.com/cilium/cilium/pkg/maps/terwaymap"
++	"github.com/cilium/cilium/pkg/terway"
++	"github.com/cilium/cilium/pkg/testutils"
++)
++
++func loadTerwayTestSpec(t *testing.T, source string) *ebpf.CollectionSpec {
++	t.Helper()
++	object := filepath.Join(os.Getenv("CILIUM_TERWAY_BPF_OBJECTS"), filepath.Base(source[:len(source)-2])+".o")
++	if os.Getenv("CILIUM_TERWAY_BPF_OBJECTS") == "" {
++		var err error
++		object, err = compile(t.Context(), hivetest.Logger(t), &progInfo{Source: source, Output: filepath.Base(object), OutputType: outputObject}, getDirs(t))
++		require.NoError(t, err)
++	}
++	spec, err := ebpf.LoadCollectionSpec(object)
++	require.NoError(t, err)
++	return spec
++}
++
++type terwayObserver struct {
++	spec       *ebpf.CollectionSpec
++	collection *ebpf.Collection
++}
++
++func (*terwayObserver) Name() string { return "terway_test_observer" }
++func (*terwayObserver) AttachmentPolicy() api_v2alpha1.CiliumDatapathPluginAttachmentPolicy {
++	return api_v2alpha1.AttachmentPolicyAlways
++}
++func (p *terwayObserver) DeepEqual(other plugin.Plugin) bool { return p == other }
++func (*terwayObserver) PrepareCollection(_ context.Context, _ *datapathplugins.PrepareCollectionRequest, _ ...grpc.CallOption) (*datapathplugins.PrepareCollectionResponse, error) {
++	return &datapathplugins.PrepareCollectionResponse{Hooks: []*datapathplugins.PrepareCollectionResponse_HookSpec{{Target: "cil_to_netdev", Type: datapathplugins.HookType_POST, Constraints: []*datapathplugins.PrepareCollectionResponse_HookSpec_OrderingConstraint{{Order: datapathplugins.PrepareCollectionResponse_HookSpec_OrderingConstraint_AFTER, Plugin: "terway_vlan"}}}}}, nil
++}
++func (p *terwayObserver) InstrumentCollection(_ context.Context, req *datapathplugins.InstrumentCollectionRequest, _ ...grpc.CallOption) (*datapathplugins.InstrumentCollectionResponse, error) {
++	hook := req.Hooks[0]
++	target, err := ebpf.NewProgramFromID(ebpf.ProgramID(hook.AttachTarget.ProgramId))
++	if err != nil {
++		return nil, err
++	}
++	defer target.Close()
++	spec := p.spec.Copy()
++	prog := spec.Programs["terway_observe"]
++	prog.AttachTarget, prog.AttachTo = target, hook.AttachTarget.SubprogName
++	spec.Programs = map[string]*ebpf.ProgramSpec{"terway_observe": prog}
++	p.collection, err = ebpf.NewCollection(spec)
++	if err != nil {
++		return nil, err
++	}
++	if err := p.collection.Programs["terway_observe"].Pin(hook.PinPath); err != nil {
++		return nil, err
++	}
++	return &datapathplugins.InstrumentCollectionResponse{}, nil
++}
++
++type terwayTestPrograms struct {
++	base        *ebpf.Collection
++	observer    *terwayObserver
++	parent, pod uint32
++	store       *terwaymap.Store
++}
++
++func newTerwayTestPrograms(t *testing.T, verdict uint32, source [4]byte) terwayTestPrograms {
++	t.Helper()
++	testutils.PrivilegedTest(t)
++	require.NoError(t, rlimit.RemoveMemlock())
++	logger := hivetest.Logger(t)
++	require.NoError(t, bpf.MkdirBPF(filepath.Dir(bpf.MapPath(logger, terwaymap.MapName))))
++	store, err := terwaymap.Open(logger, false)
++	require.NoError(t, err)
++	t.Cleanup(func() {
++		store.Close()
++		os.Remove(bpf.MapPath(logger, terwaymap.MapName))
++		os.Remove(bpf.MapPath(logger, terwaymap.StatsMapName))
++	})
++	createLink := func(name string) uint32 {
++		hw, err := net.ParseMAC("02:00:00:00:00:01")
++		require.NoError(t, err)
++		d := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name, HardwareAddr: hw}}
++		require.NoError(t, netlink.LinkAdd(d))
++		t.Cleanup(func() { netlink.LinkDel(d) })
++		return uint32(d.Attrs().Index)
++	}
++	parent, pod := createLink("tw-parent"), createLink("tw-pod")
++	require.NoError(t, store.Upsert(1, pod, parent, []netip.Addr{netip.MustParseAddr("10.0.0.2"), netip.MustParseAddr("fd00::2")}, terway.Binding{VLAN: 42, ParentMAC: "02:00:00:00:00:01"}, nil))
++	spec := loadTerwayTestSpec(t, "test-progs/bpf_terway_base.c")
++	observer := &terwayObserver{spec: spec.Copy()}
++	t.Cleanup(func() {
++		if observer.collection != nil {
++			observer.collection.Close()
++		}
++	})
++	delete(spec.Programs, "terway_observe")
++	require.NoError(t, spec.Variables["test_verdict"].Set(verdict))
++	require.NoError(t, spec.Variables["test_nat_source"].Set(binary.NativeEndian.Uint32(source[:])))
++	p := &terwayPlugin{logger: logger, spec: loadTerwayTestSpec(t, "bpf_terway.c")}
++	plugins := plugin.Plugins{p.Name(): p, observer.Name(): observer}
++	tmp := testutils.TempBPFFS(t)
++	l := newBPFCollectionLoader(true, filepath.Join(tmp, "operations"))
++	base, commit, cleanup, err := l.Load(t.Context(), logger, spec, &bpf.CollectionOptions{}, &config.Config{Plugins: plugins}, &datapathplugins.AttachmentContext{Context: &datapathplugins.AttachmentContext_Host_{Host: &datapathplugins.AttachmentContext_Host{Iface: &datapathplugins.AttachmentContext_InterfaceInfo{Name: "tw-parent"}}}}, filepath.Join(tmp, "pins"))
++	require.NoError(t, maybeReportVerifierError(err))
++	require.NoError(t, commit())
++	cleanup()
++	t.Cleanup(base.Close)
++	return terwayTestPrograms{base: base, observer: observer, parent: parent, pod: pod, store: store}
++}
++
++func testFrame(proto uint16, vlan bool) []byte {
++	frame := make([]byte, 14+64)
++	copy(frame[:6], []byte{2, 0, 0, 0, 0, 1})
++	binary.BigEndian.PutUint16(frame[12:14], proto)
++	if proto == 0x0800 {
++		frame[14] = 0x45
++		copy(frame[26:30], []byte{10, 0, 0, 2})
++	}
++	if proto == 0x86dd {
++		frame[14] = 0x60
++		ip := netip.MustParseAddr("fd00::2").As16()
++		copy(frame[22:38], ip[:])
++	}
++	if !vlan {
++		return frame
++	}
++	tagged := make([]byte, len(frame)+4)
++	copy(tagged[:12], frame[:12])
++	binary.BigEndian.PutUint16(tagged[12:14], 0x8100)
++	binary.BigEndian.PutUint16(tagged[14:16], 42)
++	copy(tagged[16:], frame[12:])
++	return tagged
++}
++
++func (p terwayTestPrograms) run(t *testing.T, target string, frame []byte, ingress uint32) (uint32, []byte) {
++	t.Helper()
++	var ctx [48]uint32
++	ctx[9], ctx[10] = ingress, p.parent
++	data := make([]byte, len(frame)+64)
++	opts := &ebpf.RunOptions{Data: frame, DataOut: data, Context: ctx}
++	ret, err := p.base.Programs[target].Run(opts)
++	require.NoError(t, err)
++	return ret, opts.DataOut
++}
++
++func TestPrivilegedTerwayIngress(t *testing.T) {
++	testutils.PrivilegedTest(t)
++	for _, proto := range []uint16{0x0800, 0x86dd, 0x0806} {
++		t.Run(fmt.Sprintf("ethertype-%x", proto), func(t *testing.T) {
++			p := newTerwayTestPrograms(t, 0, [4]byte{})
++			frame := testFrame(proto, true)
++			ret, out := p.run(t, "cil_from_netdev", frame, p.parent)
++			require.Equal(t, uint32(0), ret)
++			require.Equal(t, testFrame(proto, false), out)
++		})
++	}
++	t.Run("double-tag", func(t *testing.T) {
++		p := newTerwayTestPrograms(t, 0, [4]byte{})
++		ret, _ := p.run(t, "cil_from_netdev", testFrame(0x8100, true), p.parent)
++		require.Equal(t, uint32(2), ret)
++	})
++	t.Run("unmanaged", func(t *testing.T) {
++		p := newTerwayTestPrograms(t, 0, [4]byte{})
++		require.NoError(t, p.store.Delete(1))
++		frame := testFrame(0x0800, true)
++		ret, out := p.run(t, "cil_from_netdev", frame, p.parent)
++		require.Equal(t, uint32(0), ret)
++		require.Equal(t, frame, out)
++	})
++	t.Run("qinq", func(t *testing.T) {
++		p := newTerwayTestPrograms(t, 0, [4]byte{})
++		ret, _ := p.run(t, "cil_from_netdev", testFrame(0x88a8, false), p.parent)
++		require.Equal(t, uint32(2), ret)
++	})
++	t.Run("recycled-parent-ifindex", func(t *testing.T) {
++		p := newTerwayTestPrograms(t, 0, [4]byte{})
++		require.NoError(t, p.store.Upsert(1, p.pod, p.parent, []netip.Addr{netip.MustParseAddr("10.0.0.2")}, terway.Binding{VLAN: 42, ParentMAC: "02:00:00:00:00:02"}, nil))
++		frame := testFrame(0x0800, true)
++		ret, out := p.run(t, "cil_from_netdev", frame, p.parent)
++		require.Equal(t, uint32(0), ret)
++		require.Equal(t, frame, out)
++	})
++}
+diff --git a/pkg/terway/binding.go b/pkg/terway/binding.go
+index 5f2d420b82..bc6f9ed8e6 100644
+--- a/pkg/terway/binding.go
++++ b/pkg/terway/binding.go
+@@ -12,7 +12,7 @@ import (
+ )
+ 
+ const (
+-	PluginName        = "terway-vlan"
++	PluginName        = "terway_vlan"
+ 	VLANProperty      = "terway-vlan-id"
+ 	ParentMACProperty = "terway-parent-mac"
+ )

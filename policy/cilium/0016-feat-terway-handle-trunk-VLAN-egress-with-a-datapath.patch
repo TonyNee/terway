@@ -1,0 +1,1240 @@
+From acfcf5cb9e8a911810bf02a1e6193367e5895d38 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=99=B6=E5=B0=BC?= <taoni.nt@alibaba-inc.com>
+Date: Mon, 23 Nov 2026 17:34:49 +0800
+Subject: [PATCH 16/16] feat(terway): handle trunk VLAN egress with a datapath
+ plugin
+
+Push the endpoint VLAN after the Cilium host egress program while preserving policy verdicts and endpoint identity across NAT and tail calls. Normalize legacy PIPE only when TCX is in use.
+
+Guard mode mismatches and unsupported routing configurations, keep VLAN bindings in sync with endpoint deletion, and document opt-in migration requirements.
+
+Validate with Linux kernel dispatcher tests, race checks for allocation and map state, Hive population, and Linux arm64/amd64 agent and CNI builds. Existing endpoint fixture failures also reproduce on the unchanged baseline; cloud trunk-node integration remains pending.
+---
+ Documentation/network/ebpf/index.rst          |   1 +
+ .../network/ebpf/terway-datapath.rst          |  84 +++++++++++
+ bpf/bpf_terway.c                              |  71 ++++++++-
+ bpf/lib/terway.h                              |   1 +
+ bpf/test-progs/bpf_terway_base.c              |  31 +++-
+ daemon/cmd/cells_test.go                      |  12 ++
+ pkg/datapath/loader/plugins.go                |   2 +
+ pkg/datapath/loader/terway.go                 |  33 +++--
+ pkg/datapath/loader/terway_privileged_test.go | 139 +++++++++++++++++-
+ pkg/datapath/loader/terway_test.go            |   3 +-
+ pkg/datapath/plugins/registry.go              |   1 +
+ pkg/endpoint/api.go                           |   9 +-
+ pkg/endpoint/restore.go                       |   2 +-
+ pkg/endpoint/terway.go                        |  21 +++
+ pkg/endpoint/terway_test.go                   |  56 +++++++
+ pkg/maps/lxcmap/lxcmap.go                     | 107 ++++++++++----
+ pkg/maps/lxcmap/terway_test.go                |  31 ++++
+ pkg/maps/terwaymap/terway.go                  |  58 +++++++-
+ pkg/maps/terwaymap/terway_test.go             |  68 ++++++++-
+ pkg/option/config.go                          |   3 +
+ pkg/option/terway_test.go                     |  30 ++++
+ pkg/terway/binding_test.go                    |   3 +-
+ plugins/cilium-cni/chaining/terway/backend.go |   5 +-
+ .../chaining/terway/backend_test.go           |   7 +-
+ plugins/cilium-cni/chaining/terway/terway.go  |   3 +-
+ 25 files changed, 719 insertions(+), 62 deletions(-)
+ create mode 100644 Documentation/network/ebpf/terway-datapath.rst
+ create mode 100644 pkg/endpoint/terway_test.go
+ create mode 100644 pkg/maps/lxcmap/terway_test.go
+ create mode 100644 pkg/option/terway_test.go
+
+diff --git a/Documentation/network/ebpf/index.rst b/Documentation/network/ebpf/index.rst
+index b08537a1e6..5d617d7fc2 100644
+--- a/Documentation/network/ebpf/index.rst
++++ b/Documentation/network/ebpf/index.rst
+@@ -17,3 +17,4 @@ eBPF Datapath
+    lifeofapacket
+    maps
+    iptables
++   terway-datapath
+diff --git a/Documentation/network/ebpf/terway-datapath.rst b/Documentation/network/ebpf/terway-datapath.rst
+new file mode 100644
+index 0000000000..0d9d4926c3
+--- /dev/null
++++ b/Documentation/network/ebpf/terway-datapath.rst
+@@ -0,0 +1,84 @@
++Built-in Terway VLAN datapath
++============================
++
++The opt-in Terway extension replaces trunk VLAN pop/push actions with datapath
++plugin hooks inside ``cilium-agent``. It does not require a separate plugin
++container, plugin Unix socket, or ``CiliumDatapathPlugin`` resource.
++Kubernetes-managed datapath plugins can remain disabled.
++
++Enable the agent with ``--enable-terway-datapath=true`` and set
++``"terway-datapath": true`` on the ``cilium-cni`` entry in the CNI chain.
++For marked trunk interfaces, the chainer reads the allocation using Terway's
++existing ``GetIPInfo`` RPC; it never allocates or releases ENIs or addresses.
++The agent rejects nonzero VLAN bindings when its Terway datapath is disabled,
++and accepts ordinary endpoints without VLAN properties in either mode.
++
++This change supplies the Cilium side of the integration. Before enabling it,
++the Terway datapath must stop installing its legacy VLAN TC rules and remove
++existing rules as part of the node migration. In particular, legacy egress
++push actions must not run after the plugin, which would add a second tag.
++Recreate workloads on drained nodes: endpoints created by the old chainer do
++not have the binding metadata required for recovery in the new mode.
++
++Bindings are stored in the existing endpoint properties and restored with
++the endpoint. ``cilium_twvlan`` contains parent, endpoint-interface, and address
++bindings. Entries carry an endpoint owner so that a late delete cannot remove
++an address reassigned to a new endpoint. The parent MAC protects against
++ifindex reuse, and recovery resolves the current parent interface by MAC.
++
++Ingress hooks remove one VLAN tag before Cilium handles the packet. QinQ is
++rejected. Egress hooks use the source endpoint's ingress interface, preserving
++the binding across source-address translation, with address lookup as a
++fallback. Policy drops and redirects are preserved. ARP is untagged on ingress
++and keeps its existing egress behavior. Legacy TC PIPE verdicts are normalized
++when TCX is configured and available on the running kernel.
++
++The initial scope is native, unencrypted routing. VLAN bypass, Egress Gateway,
++and XDP acceleration are rejected; overlay, encryption, and QinQ are not
++supported. Netkit device creation and chainer support are separate follow-up
++work; the hooks operate on the parent NIC and can first be tested with veth.
++
++The pinned per-CPU map ``cilium_twstats`` exposes these counter indexes:
++
++* 0: ingress VLAN pop
++* 1: egress VLAN push
++* 2: invalid packet or nested VLAN
++* 3: VLAN pop failure
++* 4: VLAN push failure
++* 5: inconsistent endpoint/parent binding
++* 6: legacy PIPE verdict normalization
++* 7: hooks run on managed parents
++
++Validation
++----------
++
++The Go tests cover the read-only backend exchange, allocation matching,
++binding validation, map transactions, IP reuse, and orphan cleanup.
++``TestPrivilegedTerwayIngress`` and ``TestPrivilegedTerwayEgress`` load the
++hooks through Cilium's real datapath plugin dispatcher and kernel verifier.
++A second POST plugin observes the resulting kernel VLAN metadata. The base
++program can rewrite source addresses, including through a tail call, to
++exercise NAT identity preservation.
++
++Run privileged tests on Linux with ``PRIVILEGED_TESTS=true``, mounted bpffs,
++and clang available. Alternatively, compile ``bpf/bpf_terway.c`` and
++``bpf/test-progs/bpf_terway_base.c`` into a directory, then set
++``CILIUM_TERWAY_BPF_OBJECTS`` to that directory when running the tests.
++These tests complement actual trunk-node, Service, NetworkPolicy, and NIC
++VLAN-offload validation; they do not replace those integration tests.
++
++Scope and ordinary endpoints
++----------------------------
++
++The agent enables the extension at node scope. The primary Terway CNI sets
++``terway-trunk-datapath`` as the host veth alias only for DP trunk allocations.
++The Terway chainer recognizes this alias in the existing peer-link lookup and
++queries the backend only for these interfaces. The alias is kernel interface
++metadata and does not change CNI result types or packet routing. Ship both CNI
++binaries with this contract and recreate trunk endpoints when switching modes.
++
++Ordinary endpoints keep the original parent-ENI inference, do not require
++Terway VLAN properties or an additional backend RPC, and retain their normal
++creation, restore and deletion paths. Only nonzero VLAN bindings enter the
++extension's map transactions. Ordinary packets can traverse node hooks and
++continue without VLAN actions when no trunk binding matches.
+diff --git a/bpf/bpf_terway.c b/bpf/bpf_terway.c
+index da30d1c997..35a1056849 100644
+--- a/bpf/bpf_terway.c
++++ b/bpf/bpf_terway.c
+@@ -34,9 +34,76 @@ int terway_ingress(struct __ctx_buff *ctx)
+ }
+ 
+ __section("freplace")
+-int terway_egress(struct __ctx_buff *ctx __maybe_unused, int ret __maybe_unused)
++int terway_egress(struct __ctx_buff *ctx, int ret)
+ {
+-	return -1;
++	struct terway_key link_key = {
++		.ifindex = ctx->ingress_ifindex,
++		.kind = TERWAY_LINK,
++	};
++	struct terway_key source_key = { .ifindex = ctx->ifindex };
++	const struct terway_value *link, *source, *binding;
++	__u16 proto;
++	int proceed = -1;
++
++	/* A POST hook must never turn a policy drop or redirect into a pass.
++	 * TC_ACT_PIPE is a legacy Terway patch, not a valid TCX verdict.
++	 */
++	if (ret != CTX_ACT_OK && ret != CTX_ACT_PIPE && ret != -1)
++		return -1;
++	if (ret == CTX_ACT_PIPE && terway_normalize_pipe) {
++		terway_count(TERWAY_NORMALIZE_PIPE);
++		proceed = CTX_ACT_OK;
++	}
++	if (!terway_managed_parent(ctx->ifindex))
++		return proceed;
++	terway_count(TERWAY_HOOK_RUN);
++	link = map_lookup_elem(&cilium_twvlan, &link_key);
++	if (skb_load_bytes(ctx, 12, &proto, sizeof(proto)) < 0)
++		return terway_drop(TERWAY_DROP_INVALID);
++	if (link && (proto == bpf_htons(0x8100) || proto == bpf_htons(0x88a8)))
++		return terway_drop(TERWAY_DROP_BINDING);
++	if (proto == bpf_htons(0x0800)) {
++		source_key.kind = TERWAY_IPV4;
++		if (skb_load_bytes(ctx, 26, source_key.address, 4) < 0)
++			return terway_drop(TERWAY_DROP_INVALID);
++	} else if (proto == bpf_htons(0x86dd)) {
++		source_key.kind = TERWAY_IPV6;
++		if (skb_load_bytes(ctx, 22, source_key.address, 16) < 0)
++			return terway_drop(TERWAY_DROP_INVALID);
++	} else {
++		/* The legacy egress rules only tag IP traffic. Host ARP and other
++		 * control traffic continue to use their existing paths.
++		 */
++		return proceed;
++	}
++	source = map_lookup_elem(&cilium_twvlan, &source_key);
++	if (link && link->parent != ctx->ifindex)
++		return terway_drop(TERWAY_DROP_BINDING);
++	if (link && source && link->owner != source->owner)
++		return terway_drop(TERWAY_DROP_BINDING);
++	/* skb_iif identifies the source endpoint even after Cilium rewrites the
++	 * source address (SNAT or service reverse NAT). Do not borrow skb->cb or
++	 * skb->mark: Cilium owns and clears those fields. Address lookup is only
++	 * a fallback for traffic without a local endpoint ingress interface.
++	 */
++	binding = link ? link : source;
++	if (!binding)
++		return proceed;
++	if (!binding->owner || !binding->vlan || binding->vlan > 4094)
++		return terway_drop(TERWAY_DROP_BINDING);
++#pragma unroll
++	for (int i = 0; i < 6; i++)
++		if (binding->mac[i] != terway_parent_mac[i])
++			return terway_drop(TERWAY_DROP_BINDING);
++	if (ctx->vlan_present) {
++		if ((ctx->vlan_tci & 0xfff) != binding->vlan)
++			return terway_drop(TERWAY_DROP_BINDING);
++		return proceed;
++	}
++	if (skb_vlan_push(ctx, bpf_htons(0x8100), binding->vlan) < 0)
++		return terway_drop(TERWAY_DROP_PUSH);
++	terway_count(TERWAY_EGRESS_PUSH);
++	return proceed;
+ }
+ 
+ BPF_LICENSE("Dual BSD/GPL");
+diff --git a/bpf/lib/terway.h b/bpf/lib/terway.h
+index a9fccd0d56..7aa03c94eb 100644
+--- a/bpf/lib/terway.h
++++ b/bpf/lib/terway.h
+@@ -71,6 +71,7 @@ static __always_inline void terway_count(__u32 reason)
+  * state for a recycled ifindex from claiming an unrelated new interface.
+  */
+ const volatile __u8 terway_parent_mac[6];
++const volatile __u8 terway_normalize_pipe;
+ 
+ static __always_inline bool terway_managed_parent(__u32 ifindex)
+ {
+diff --git a/bpf/test-progs/bpf_terway_base.c b/bpf/test-progs/bpf_terway_base.c
+index f501ecf05d..105189ffdd 100644
+--- a/bpf/test-progs/bpf_terway_base.c
++++ b/bpf/test-progs/bpf_terway_base.c
+@@ -3,9 +3,18 @@
+ 
+ #include <bpf/ctx/skb.h>
+ #include <bpf/api.h>
++#include "lib/endian.h"
+ 
+ const volatile __u32 test_verdict;
+ const volatile __u32 test_nat_source;
++const volatile __u32 test_tail_call;
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__type(key, __u32);
++	__type(value, __u32);
++	__uint(max_entries, 1);
++} tw_tail __section_maps_btf;
+ 
+ __section_entry
+ int cil_from_netdev(struct __ctx_buff *ctx __maybe_unused)
+@@ -13,18 +22,34 @@ int cil_from_netdev(struct __ctx_buff *ctx __maybe_unused)
+ 	return test_verdict;
+ }
+ 
+-__section_entry
+-int cil_to_netdev(struct __ctx_buff *ctx)
++static __always_inline int test_egress(struct __ctx_buff *ctx)
+ {
+ 	if (test_nat_source) {
+ 		__u32 source = test_nat_source;
++		__u32 offset = ctx->protocol == bpf_htons(0x86dd) ? 22 : 26;
+ 
+-		if (skb_store_bytes(ctx, 26, &source, sizeof(source), 0) < 0)
++		if (skb_store_bytes(ctx, offset, &source, sizeof(source), 0) < 0)
+ 			return CTX_ACT_DROP;
+ 	}
+ 	return test_verdict;
+ }
+ 
++__section_entry
++int terway_tail(struct __ctx_buff *ctx)
++{
++	return test_egress(ctx);
++}
++
++__section_entry
++int cil_to_netdev(struct __ctx_buff *ctx)
++{
++	if (test_tail_call) {
++		tail_call(ctx, &tw_tail, 0);
++		return CTX_ACT_DROP;
++	}
++	return test_egress(ctx);
++}
++
+ struct {
+ 	__uint(type, BPF_MAP_TYPE_ARRAY);
+ 	__type(key, __u32);
+diff --git a/daemon/cmd/cells_test.go b/daemon/cmd/cells_test.go
+index 44056a91ea..f66104fad4 100644
+--- a/daemon/cmd/cells_test.go
++++ b/daemon/cmd/cells_test.go
+@@ -45,3 +45,15 @@ func TestAgentCell(t *testing.T) {
+ 	err := hive.New(Agent).Populate(hivetest.Logger(t))
+ 	assert.NoError(t, err, "Populate()")
+ }
++
++func TestAgentCellTerwayDatapath(t *testing.T) {
++	defer testutils.GoleakVerifyNone(t, goleakOptions...)
++	defer metrics.Reinitialize()
++	old := option.Config.EnableTerwayDatapath
++	defer func() { option.Config.EnableTerwayDatapath = old }()
++	option.Config.EnableTerwayDatapath = true
++	option.Config.IPv4ServiceRange = AutoCIDR
++	option.Config.IPv6ServiceRange = AutoCIDR
++	err := hive.New(Agent).Populate(hivetest.Logger(t))
++	assert.NoError(t, err, "Populate() with the built-in Terway plugin")
++}
+diff --git a/pkg/datapath/loader/plugins.go b/pkg/datapath/loader/plugins.go
+index 83d4e41d52..416327e1b8 100644
+--- a/pkg/datapath/loader/plugins.go
++++ b/pkg/datapath/loader/plugins.go
+@@ -137,6 +137,8 @@ func (l *bpfCollectionLoader) runGC(logger *slog.Logger, jg job.Group) {
+ 
+ 		for {
+ 			select {
++			case <-ctx.Done():
++				return nil
+ 			case <-l.gcWakeup:
+ 			case <-retry:
+ 			}
+diff --git a/pkg/datapath/loader/terway.go b/pkg/datapath/loader/terway.go
+index a007659810..d7f55e9512 100644
+--- a/pkg/datapath/loader/terway.go
++++ b/pkg/datapath/loader/terway.go
+@@ -17,11 +17,15 @@ import (
+ 
+ 	"github.com/cilium/cilium/api/v1/datapathplugins"
+ 	"github.com/cilium/cilium/pkg/bpf"
++	ipsectypes "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
++	"github.com/cilium/cilium/pkg/datapath/linux/probes"
++	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
+ 	plugin "github.com/cilium/cilium/pkg/datapath/plugins/types"
+ 	api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+ 	"github.com/cilium/cilium/pkg/maps/terwaymap"
+ 	"github.com/cilium/cilium/pkg/option"
+-	"github.com/vishvananda/netlink"
++	"github.com/cilium/cilium/pkg/terway"
++	wgtypes "github.com/cilium/cilium/pkg/wireguard/types"
+ )
+ 
+ type terwayPluginOut struct {
+@@ -32,20 +36,24 @@ type terwayPluginOut struct {
+ // The built-in client uses the same prepare/instrument protocol as an external
+ // plugin, without a socket, CRD, or separate process. The registry exposes it
+ // even when Kubernetes-managed datapath plugins are disabled.
+-func newTerwayPlugin(logger *slog.Logger) terwayPluginOut {
++func newTerwayPlugin(logger *slog.Logger, ipsec ipsectypes.Config, wireguard wgtypes.Config) (terwayPluginOut, error) {
+ 	if !option.Config.EnableTerwayDatapath {
+-		return terwayPluginOut{}
++		return terwayPluginOut{}, nil
+ 	}
+-	return terwayPluginOut{Plugins: []plugin.Plugin{&terwayPlugin{logger: logger}}}
++	if ipsec.Enabled() || wireguard.Enabled() {
++		return terwayPluginOut{}, fmt.Errorf("Terway VLAN datapath does not support encrypted host-device paths")
++	}
++	return terwayPluginOut{Plugins: []plugin.Plugin{&terwayPlugin{logger: logger, normalizePipe: option.Config.EnableTCX}}}, nil
+ }
+ 
+ type terwayPlugin struct {
+-	logger *slog.Logger
+-	mu     sync.Mutex
+-	spec   *ebpf.CollectionSpec
++	logger        *slog.Logger
++	mu            sync.Mutex
++	spec          *ebpf.CollectionSpec
++	normalizePipe bool
+ }
+ 
+-func (*terwayPlugin) Name() string { return "terway_vlan" }
++func (*terwayPlugin) Name() string { return terway.PluginName }
+ func (*terwayPlugin) AttachmentPolicy() api_v2alpha1.CiliumDatapathPluginAttachmentPolicy {
+ 	return api_v2alpha1.AttachmentPolicyAlways
+ }
+@@ -96,7 +104,7 @@ func (p *terwayPlugin) collectionSpec(ctx context.Context) (*ebpf.CollectionSpec
+ 
+ func (p *terwayPlugin) InstrumentCollection(ctx context.Context, req *datapathplugins.InstrumentCollectionRequest, _ ...grpc.CallOption) (*datapathplugins.InstrumentCollectionResponse, error) {
+ 	iface := req.GetAttachmentContext().GetHost().GetIface().GetName()
+-	device, err := netlink.LinkByName(iface)
++	device, err := safenetlink.LinkByName(iface)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("resolve Terway attachment device: %w", err)
+ 	}
+@@ -110,6 +118,13 @@ func (p *terwayPlugin) InstrumentCollection(ctx context.Context, req *datapathpl
+ 		if err := spec.Variables["terway_parent_mac"].Set(parentMAC); err != nil {
+ 			return nil, err
+ 		}
++		var normalize uint8
++		if p.normalizePipe && probes.HaveTCX() == nil {
++			normalize = 1
++		}
++		if err := spec.Variables["terway_normalize_pipe"].Set(normalize); err != nil {
++			return nil, err
++		}
+ 		name := "terway_ingress"
+ 		if hook.GetType() == datapathplugins.HookType_POST {
+ 			name = "terway_egress"
+diff --git a/pkg/datapath/loader/terway_privileged_test.go b/pkg/datapath/loader/terway_privileged_test.go
+index d5fe8d5dba..559ae5282a 100644
+--- a/pkg/datapath/loader/terway_privileged_test.go
++++ b/pkg/datapath/loader/terway_privileged_test.go
+@@ -26,10 +26,29 @@ import (
+ 	plugin "github.com/cilium/cilium/pkg/datapath/plugins/types"
+ 	api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+ 	"github.com/cilium/cilium/pkg/maps/terwaymap"
++	"github.com/cilium/cilium/pkg/option"
+ 	"github.com/cilium/cilium/pkg/terway"
+ 	"github.com/cilium/cilium/pkg/testutils"
+ )
+ 
++func TestPrivilegedTerwayRuntimeCompiler(t *testing.T) {
++	testutils.PrivilegedTest(t)
++	oldBPF, oldState := option.Config.BpfDir, option.Config.StateDir
++	t.Cleanup(func() { option.Config.BpfDir, option.Config.StateDir = oldBPF, oldState })
++	option.Config.BpfDir = bpfDir
++	option.Config.StateDir = t.TempDir()
++	p := &terwayPlugin{logger: hivetest.Logger(t)}
++	spec, err := p.collectionSpec(t.Context())
++	require.NoError(t, err)
++	require.Equal(t, ebpf.Extension, spec.Programs["terway_ingress"].Type)
++	require.Equal(t, ebpf.Extension, spec.Programs["terway_egress"].Type)
++	require.Equal(t, uint32(24), spec.Maps[terwaymap.MapName].KeySize)
++	require.Equal(t, uint32(20), spec.Maps[terwaymap.MapName].ValueSize)
++	other, err := p.collectionSpec(t.Context())
++	require.NoError(t, err)
++	require.NotSame(t, spec, other)
++}
++
+ func loadTerwayTestSpec(t *testing.T, source string) *ebpf.CollectionSpec {
+ 	t.Helper()
+ 	object := filepath.Join(os.Getenv("CILIUM_TERWAY_BPF_OBJECTS"), filepath.Base(source[:len(source)-2])+".o")
+@@ -84,8 +103,17 @@ type terwayTestPrograms struct {
+ 	store       *terwaymap.Store
+ }
+ 
+-func newTerwayTestPrograms(t *testing.T, verdict uint32, source [4]byte) terwayTestPrograms {
++type terwayTestOptions struct {
++	normalizePipe bool
++	tailCall      bool
++}
++
++func newTerwayTestPrograms(t *testing.T, verdict uint32, source [4]byte, options ...terwayTestOptions) terwayTestPrograms {
+ 	t.Helper()
++	var opts terwayTestOptions
++	if len(options) != 0 {
++		opts = options[0]
++	}
+ 	testutils.PrivilegedTest(t)
+ 	require.NoError(t, rlimit.RemoveMemlock())
+ 	logger := hivetest.Logger(t)
+@@ -117,18 +145,125 @@ func newTerwayTestPrograms(t *testing.T, verdict uint32, source [4]byte) terwayT
+ 	delete(spec.Programs, "terway_observe")
+ 	require.NoError(t, spec.Variables["test_verdict"].Set(verdict))
+ 	require.NoError(t, spec.Variables["test_nat_source"].Set(binary.NativeEndian.Uint32(source[:])))
+-	p := &terwayPlugin{logger: logger, spec: loadTerwayTestSpec(t, "bpf_terway.c")}
++	if opts.tailCall {
++		require.NoError(t, spec.Variables["test_tail_call"].Set(uint32(1)))
++	}
++	p := &terwayPlugin{logger: logger, spec: loadTerwayTestSpec(t, "bpf_terway.c"), normalizePipe: opts.normalizePipe}
+ 	plugins := plugin.Plugins{p.Name(): p, observer.Name(): observer}
+ 	tmp := testutils.TempBPFFS(t)
+ 	l := newBPFCollectionLoader(true, filepath.Join(tmp, "operations"))
+ 	base, commit, cleanup, err := l.Load(t.Context(), logger, spec, &bpf.CollectionOptions{}, &config.Config{Plugins: plugins}, &datapathplugins.AttachmentContext{Context: &datapathplugins.AttachmentContext_Host_{Host: &datapathplugins.AttachmentContext_Host{Iface: &datapathplugins.AttachmentContext_InterfaceInfo{Name: "tw-parent"}}}}, filepath.Join(tmp, "pins"))
+ 	require.NoError(t, maybeReportVerifierError(err))
++	if opts.tailCall {
++		require.NoError(t, base.Maps["tw_tail"].Update(uint32(0), base.Programs["terway_tail"], ebpf.UpdateAny))
++	}
+ 	require.NoError(t, commit())
+ 	cleanup()
+ 	t.Cleanup(base.Close)
+ 	return terwayTestPrograms{base: base, observer: observer, parent: parent, pod: pod, store: store}
+ }
+ 
++func TestPrivilegedTerwayEgress(t *testing.T) {
++	testutils.PrivilegedTest(t)
++	for _, proto := range []uint16{0x0800, 0x86dd} {
++		t.Run(fmt.Sprintf("ethertype-%x", proto), func(t *testing.T) {
++			p := newTerwayTestPrograms(t, 0, [4]byte{})
++			ret, _ := p.run(t, "cil_to_netdev", testFrame(proto, false), p.pod)
++			require.Equal(t, uint32(0), ret)
++			var observed [4]uint32
++			require.NoError(t, p.observer.collection.Maps["tw_observe"].Lookup(uint32(0), &observed))
++			require.Equal(t, uint32(1), observed[0])
++			require.Equal(t, uint32(42), observed[1]&0xfff)
++		})
++	}
++	for _, proto := range []uint16{0x0800, 0x86dd} {
++		t.Run(fmt.Sprintf("NAT-keeps-endpoint-VLAN-%x", proto), func(t *testing.T) {
++			p := newTerwayTestPrograms(t, 0, [4]byte{192, 0, 2, 1})
++			ret, out := p.run(t, "cil_to_netdev", testFrame(proto, false), p.pod)
++			require.Equal(t, uint32(0), ret)
++			offset := 26
++			if proto == 0x86dd {
++				offset = 22
++			}
++			require.Equal(t, []byte{192, 0, 2, 1}, out[offset:offset+4])
++			var observed [4]uint32
++			require.NoError(t, p.observer.collection.Maps["tw_observe"].Lookup(uint32(0), &observed))
++			require.Equal(t, uint32(1), observed[0])
++			require.Equal(t, uint32(42), observed[1]&0xfff)
++		})
++	}
++	for _, verdict := range []uint32{2, 7} {
++		t.Run(fmt.Sprintf("preserve-verdict-%d", verdict), func(t *testing.T) {
++			p := newTerwayTestPrograms(t, verdict, [4]byte{})
++			ret, _ := p.run(t, "cil_to_netdev", testFrame(0x0800, false), p.pod)
++			require.Equal(t, verdict, ret)
++			var observed [4]uint32
++			require.NoError(t, p.observer.collection.Maps["tw_observe"].Lookup(uint32(0), &observed))
++			require.Zero(t, observed[0])
++		})
++	}
++	for _, normalize := range []bool{false, true} {
++		t.Run(fmt.Sprintf("legacy-pipe-normalize-%v", normalize), func(t *testing.T) {
++			p := newTerwayTestPrograms(t, 3, [4]byte{}, terwayTestOptions{normalizePipe: normalize})
++			ret, _ := p.run(t, "cil_to_netdev", testFrame(0x0800, false), p.pod)
++			if normalize {
++				require.Equal(t, uint32(0), ret)
++			} else {
++				require.Equal(t, uint32(3), ret)
++			}
++		})
++	}
++	t.Run("ordinary-host-traffic", func(t *testing.T) {
++		p := newTerwayTestPrograms(t, 0, [4]byte{})
++		frame := testFrame(0x0800, false)
++		copy(frame[26:30], []byte{192, 0, 2, 1})
++		ret, _ := p.run(t, "cil_to_netdev", frame, p.parent)
++		require.Equal(t, uint32(0), ret)
++		var observed [4]uint32
++		require.NoError(t, p.observer.collection.Maps["tw_observe"].Lookup(uint32(0), &observed))
++		require.Zero(t, observed[0])
++	})
++	t.Run("source-address-fallback", func(t *testing.T) {
++		p := newTerwayTestPrograms(t, 0, [4]byte{})
++		ret, _ := p.run(t, "cil_to_netdev", testFrame(0x0800, false), p.parent)
++		require.Equal(t, uint32(0), ret)
++		var observed [4]uint32
++		require.NoError(t, p.observer.collection.Maps["tw_observe"].Lookup(uint32(0), &observed))
++		require.Equal(t, uint32(42), observed[1]&0xfff)
++	})
++	t.Run("conflicting-endpoint-identity", func(t *testing.T) {
++		p := newTerwayTestPrograms(t, 0, [4]byte{})
++		require.NoError(t, p.store.Upsert(2, p.pod+100, p.parent, []netip.Addr{netip.MustParseAddr("10.0.0.3")}, terway.Binding{VLAN: 43, ParentMAC: "02:00:00:00:00:01"}, nil))
++		frame := testFrame(0x0800, false)
++		copy(frame[26:30], []byte{10, 0, 0, 3})
++		ret, _ := p.run(t, "cil_to_netdev", frame, p.pod)
++		require.Equal(t, uint32(2), ret)
++	})
++	t.Run("wrong-parent", func(t *testing.T) {
++		p := newTerwayTestPrograms(t, 0, [4]byte{})
++		binding := terway.Binding{VLAN: 42, ParentMAC: "02:00:00:00:00:01"}
++		require.NoError(t, p.store.Upsert(2, p.pod+100, p.parent, []netip.Addr{netip.MustParseAddr("10.0.0.3")}, binding, nil))
++		require.NoError(t, p.store.Upsert(1, p.pod, p.parent+100, []netip.Addr{netip.MustParseAddr("10.0.0.2")}, binding, nil))
++		ret, _ := p.run(t, "cil_to_netdev", testFrame(0x0800, false), p.pod)
++		require.Equal(t, uint32(2), ret)
++	})
++	t.Run("reject-pod-supplied-tag", func(t *testing.T) {
++		p := newTerwayTestPrograms(t, 0, [4]byte{})
++		ret, _ := p.run(t, "cil_to_netdev", testFrame(0x0800, true), p.pod)
++		require.Equal(t, uint32(2), ret)
++	})
++	t.Run("NAT-tail-call-returns-to-post-hook", func(t *testing.T) {
++		p := newTerwayTestPrograms(t, 0, [4]byte{192, 0, 2, 1}, terwayTestOptions{tailCall: true})
++		ret, out := p.run(t, "cil_to_netdev", testFrame(0x0800, false), p.pod)
++		require.Zero(t, ret)
++		require.Equal(t, []byte{192, 0, 2, 1}, out[26:30])
++		var observed [4]uint32
++		require.NoError(t, p.observer.collection.Maps["tw_observe"].Lookup(uint32(0), &observed))
++		require.Equal(t, uint32(1), observed[0])
++		require.Equal(t, uint32(42), observed[1]&0xfff)
++	})
++}
++
+ func testFrame(proto uint16, vlan bool) []byte {
+ 	frame := make([]byte, 14+64)
+ 	copy(frame[:6], []byte{2, 0, 0, 0, 0, 1})
+diff --git a/pkg/datapath/loader/terway_test.go b/pkg/datapath/loader/terway_test.go
+index ca4471e6d0..d87a3a947b 100644
+--- a/pkg/datapath/loader/terway_test.go
++++ b/pkg/datapath/loader/terway_test.go
+@@ -6,8 +6,9 @@ package loader
+ import (
+ 	"testing"
+ 
+-	"github.com/cilium/cilium/api/v1/datapathplugins"
+ 	"github.com/stretchr/testify/require"
++
++	"github.com/cilium/cilium/api/v1/datapathplugins"
+ )
+ 
+ func TestTerwayHookSelection(t *testing.T) {
+diff --git a/pkg/datapath/plugins/registry.go b/pkg/datapath/plugins/registry.go
+index e1cda872d7..ce1c7651cf 100644
+--- a/pkg/datapath/plugins/registry.go
++++ b/pkg/datapath/plugins/registry.go
+@@ -65,6 +65,7 @@ func provideRegistry(p registryParams) types.Registry {
+ 	r.builtins = make(types.Plugins, len(p.Builtins))
+ 	for _, plugin := range p.Builtins {
+ 		r.builtins[plugin.Name()] = plugin
++		p.Logger.Info("Register built-in datapath plugin", logfields.CiliumDatapathPluginName, plugin.Name())
+ 	}
+ 	return r
+ }
+diff --git a/pkg/endpoint/api.go b/pkg/endpoint/api.go
+index 3d9fe8dbb3..b58b21f118 100644
+--- a/pkg/endpoint/api.go
++++ b/pkg/endpoint/api.go
+@@ -27,7 +27,6 @@ import (
+ 	"github.com/cilium/cilium/pkg/option"
+ 	"github.com/cilium/cilium/pkg/policy"
+ 	"github.com/cilium/cilium/pkg/policy/trafficdirection"
+-	"github.com/cilium/cilium/pkg/terway"
+ 	"github.com/cilium/cilium/pkg/u8proto"
+ )
+ 
+@@ -155,12 +154,8 @@ func NewEndpointFromChangeModel(p EndpointParams, dnsRulesAPI DNSRulesAPI, proxy
+ 	if model.Properties != nil {
+ 		ep.properties = model.Properties
+ 	}
+-	if option.Config.EnableTerwayDatapath && !ep.IsHost() {
+-		if _, present, err := terway.ParseBinding(ep.GetPropertyValue); err != nil {
+-			return nil, err
+-		} else if !present {
+-			return nil, fmt.Errorf("Terway datapath requires network binding properties from the Terway chainer")
+-		}
++	if err := ep.validateTerwayBinding(); err != nil {
++		return nil, err
+ 	}
+ 
+ 	if ep.parentIfIndex == 0 {
+diff --git a/pkg/endpoint/restore.go b/pkg/endpoint/restore.go
+index 0985841f72..a30c0824e8 100644
+--- a/pkg/endpoint/restore.go
++++ b/pkg/endpoint/restore.go
+@@ -554,7 +554,7 @@ func (ep *Endpoint) UnmarshalJSON(raw []byte) error {
+ 	}
+ 
+ 	ep.fromSerializedEndpoint(restoredEp)
+-	if option.Config.EnableTerwayDatapath && !ep.IsHost() {
++	if option.Config.EnableTerwayDatapath && !ep.IsHost() && !ep.IsAtHostNS() {
+ 		binding, present, err := terway.ParseBinding(ep.GetPropertyValue)
+ 		if err != nil {
+ 			return err
+diff --git a/pkg/endpoint/terway.go b/pkg/endpoint/terway.go
+index 5fe16f8e7c..82751b0ff4 100644
+--- a/pkg/endpoint/terway.go
++++ b/pkg/endpoint/terway.go
+@@ -1,5 +1,26 @@
+ package endpoint
+ 
++import (
++	"fmt"
++
++	"github.com/cilium/cilium/pkg/option"
++	"github.com/cilium/cilium/pkg/terway"
++)
++
++func (e *Endpoint) validateTerwayBinding() error {
++	if e.IsHost() || e.IsAtHostNS() {
++		return nil
++	}
++	binding, present, err := terway.ParseBinding(e.GetPropertyValue)
++	if err != nil {
++		return err
++	}
++	if present && binding.VLAN != 0 && !option.Config.EnableTerwayDatapath {
++		return fmt.Errorf("Terway chainer datapath mode is enabled but the agent's Terway datapath is disabled")
++	}
++	return nil
++}
++
+ func (e *Endpoint) GetENIIndex() int64 {
+ 	return e.eniInterfaceIndex
+ }
+diff --git a/pkg/endpoint/terway_test.go b/pkg/endpoint/terway_test.go
+new file mode 100644
+index 0000000000..3d8db53755
+--- /dev/null
++++ b/pkg/endpoint/terway_test.go
+@@ -0,0 +1,56 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++package endpoint
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/cilium/cilium/pkg/option"
++	"github.com/cilium/cilium/pkg/terway"
++)
++
++func TestTerwayDatapathModeAgreement(t *testing.T) {
++	old := option.Config.EnableTerwayDatapath
++	t.Cleanup(func() { option.Config.EnableTerwayDatapath = old })
++	for _, enabled := range []bool{false, true} {
++		option.Config.EnableTerwayDatapath = enabled
++		for _, present := range []bool{false, true} {
++			ep := &Endpoint{properties: map[string]any{}}
++			if present {
++				ep.properties = (terway.Binding{VLAN: 42, ParentMAC: "02:00:00:00:00:01"}).Properties()
++			}
++			err := ep.validateTerwayBinding()
++			if enabled || !present {
++				require.NoError(t, err)
++			} else {
++				require.Error(t, err)
++			}
++		}
++	}
++}
++
++func TestOrdinaryEndpointRestoreWithTerwayDatapath(t *testing.T) {
++	old := option.Config.EnableTerwayDatapath
++	option.Config.EnableTerwayDatapath = true
++	t.Cleanup(func() { option.Config.EnableTerwayDatapath = old })
++	for _, properties := range []map[string]any{nil, (terway.Binding{VLAN: 0, ParentMAC: "02:00:00:00:00:01"}).Properties()} {
++		ep := &Endpoint{parentIfIndex: 12345, properties: properties}
++		raw, err := ep.MarshalJSON()
++		require.NoError(t, err)
++		restored := &Endpoint{}
++		require.NoError(t, restored.UnmarshalJSON(raw))
++		require.Equal(t, 12345, restored.parentIfIndex)
++		require.NoError(t, restored.validateTerwayBinding())
++	}
++}
++
++func TestLegacyZeroVLANDoesNotRequireTerwayDatapath(t *testing.T) {
++	old := option.Config.EnableTerwayDatapath
++	option.Config.EnableTerwayDatapath = false
++	t.Cleanup(func() { option.Config.EnableTerwayDatapath = old })
++	ep := &Endpoint{properties: (terway.Binding{VLAN: 0, ParentMAC: "02:00:00:00:00:01"}).Properties()}
++	require.NoError(t, ep.validateTerwayBinding())
++}
+diff --git a/pkg/maps/lxcmap/lxcmap.go b/pkg/maps/lxcmap/lxcmap.go
+index dda729e1dc..1844d0680f 100644
+--- a/pkg/maps/lxcmap/lxcmap.go
++++ b/pkg/maps/lxcmap/lxcmap.go
+@@ -252,6 +252,17 @@ func (v *EndpointInfo) String() string {
+ 
+ func (v *EndpointInfo) New() bpf.MapValue { return &EndpointInfo{} }
+ 
++// endpointTrunkBinding keeps ordinary endpoints on the original LXC map path.
++// Older endpoints may carry a zero-VLAN binding; those are ordinary as well.
++func endpointTrunkBinding(f any) (terway.Binding, bool, error) {
++	getter, ok := f.(interface{ GetPropertyValue(string) any })
++	if !ok {
++		return terway.Binding{}, false, nil
++	}
++	binding, present, err := terway.ParseBinding(getter.GetPropertyValue)
++	return binding, present && binding.VLAN != 0, err
++}
++
+ func (m *lxcMap) WriteEndpoint(f EndpointFrontend) error {
+ 	info, err := m.getBPFValue(f)
+ 	if err != nil {
+@@ -259,25 +270,22 @@ func (m *lxcMap) WriteEndpoint(f EndpointFrontend) error {
+ 	}
+ 
+ 	publish := func() error { return m.writeEndpoint(f, info) }
+-	if m.terway != nil && !f.IsAtHostNS() {
+-		getter, ok := f.(interface{ GetPropertyValue(string) any })
+-		if ok {
+-			binding, present, err := terway.ParseBinding(getter.GetPropertyValue)
+-			if err != nil {
+-				return err
+-			}
+-			if !present {
+-				return fmt.Errorf("missing Terway endpoint binding")
+-			}
+-			parent, err := netlink.LinkByIndex(f.GetParentIfIndex())
+-			if err != nil {
+-				return fmt.Errorf("resolve Terway parent ENI: %w", err)
+-			}
+-			if parent.Attrs().HardwareAddr.String() != binding.ParentMAC {
+-				return fmt.Errorf("Terway parent ENI identity changed")
+-			}
+-			return m.terway.Upsert(uint32(f.GetID()), uint32(f.GetIfIndex()), uint32(f.GetParentIfIndex()), []netip.Addr{f.IPv4Address(), f.IPv6Address()}, binding, publish)
++	if m.terway != nil && !f.IsAtHostNS() && f.GetIdentity() != identity.ReservedIdentityHost {
++		binding, trunk, err := endpointTrunkBinding(f)
++		if err != nil {
++			return err
++		}
++		if !trunk {
++			return publish()
++		}
++		parent, err := netlink.LinkByIndex(f.GetParentIfIndex())
++		if err != nil {
++			return fmt.Errorf("resolve Terway parent ENI: %w", err)
++		}
++		if parent.Attrs().HardwareAddr.String() != binding.ParentMAC {
++			return fmt.Errorf("Terway parent ENI identity changed")
+ 		}
++		return m.terway.Upsert(uint32(f.GetID()), uint32(f.GetIfIndex()), uint32(f.GetParentIfIndex()), []netip.Addr{f.IPv4Address(), f.IPv6Address()}, binding, publish)
+ 	}
+ 	return publish()
+ }
+@@ -319,23 +327,68 @@ func (m *lxcMap) SyncHostEntry(addr netip.Addr) (bool, error) {
+ }
+ 
+ func (m *lxcMap) DeleteEntry(addr netip.Addr) error {
++	if m.terway != nil {
++		key := newEndpointKey(addr)
++		value, err := m.bpfMap.Lookup(key)
++		if err == nil {
++			info := *value.(*EndpointInfo)
++			return m.terway.DeleteAddress(info.ParentIfIndex, addr, uint32(info.LxcID), func() error {
++				current, err := m.bpfMap.Lookup(key)
++				if err != nil {
++					if errors.Is(err, unix.ENOENT) {
++						return nil
++					}
++					return err
++				}
++				live := current.(*EndpointInfo)
++				if live.LxcID != info.LxcID || live.IfIndex != info.IfIndex || live.ParentIfIndex != info.ParentIfIndex {
++					return nil
++				}
++				return m.bpfMap.Delete(key)
++			})
++		}
++	}
+ 	return m.bpfMap.Delete(newEndpointKey(addr))
+ }
+ 
+ func (m *lxcMap) DeleteElement(logger *slog.Logger, f EndpointFrontend) []error {
+-	var errors []error
+-	if m.terway != nil {
+-		if err := m.terway.Delete(uint32(f.GetID())); err != nil {
+-			errors = append(errors, err)
++	trunk := false
++	if m.terway != nil && !f.IsAtHostNS() && f.GetIdentity() != identity.ReservedIdentityHost {
++		_, managed, err := endpointTrunkBinding(f)
++		if err != nil {
++			return []error{err}
+ 		}
++		trunk = managed
+ 	}
+-	for _, k := range m.getBPFKeys(f) {
+-		if err := m.bpfMap.Delete(k); err != nil {
+-			errors = append(errors, fmt.Errorf("unable to delete key %v from %s: %w", k, bpf.MapPath(logger, mapName), err))
++	var errs []error
++	remove := func() error {
++		for _, k := range m.getBPFKeys(f) {
++			if trunk {
++				current, err := m.bpfMap.Lookup(k)
++				if err != nil {
++					if !errors.Is(err, unix.ENOENT) {
++						errs = append(errs, err)
++					}
++					continue
++				}
++				if current.(*EndpointInfo).LxcID != uint16(f.GetID()) {
++					continue
++				}
++			}
++			if err := m.bpfMap.Delete(k); err != nil {
++				errs = append(errs, fmt.Errorf("unable to delete key %v from %s: %w", k, bpf.MapPath(logger, mapName), err))
++			}
+ 		}
++		return errors.Join(errs...)
+ 	}
+-
+-	return errors
++	if trunk {
++		if err := m.terway.DeleteWithPublish(uint32(f.GetID()), remove); err != nil {
++			return []error{err}
++		}
++		return nil
++	}
++	_ = remove()
++	return errs
+ }
+ 
+ func (m *lxcMap) Dump(hash map[string][]string) error {
+diff --git a/pkg/maps/lxcmap/terway_test.go b/pkg/maps/lxcmap/terway_test.go
+new file mode 100644
+index 0000000000..d464de7068
+--- /dev/null
++++ b/pkg/maps/lxcmap/terway_test.go
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++package lxcmap
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/cilium/cilium/pkg/terway"
++)
++
++type bindingProperties map[string]any
++
++func (p bindingProperties) GetPropertyValue(k string) any { return p[k] }
++
++func TestEndpointTrunkBinding(t *testing.T) {
++	for _, ordinary := range []any{struct{}{}, bindingProperties{}, bindingProperties((terway.Binding{VLAN: 0, ParentMAC: "02:00:00:00:00:01"}).Properties())} {
++		_, trunk, err := endpointTrunkBinding(ordinary)
++		require.NoError(t, err)
++		require.False(t, trunk)
++	}
++	want := terway.Binding{VLAN: 42, ParentMAC: "02:00:00:00:00:01"}
++	got, trunk, err := endpointTrunkBinding(bindingProperties(want.Properties()))
++	require.NoError(t, err)
++	require.True(t, trunk)
++	require.Equal(t, want, got)
++	_, _, err = endpointTrunkBinding(bindingProperties{terway.VLANProperty: "42"})
++	require.Error(t, err)
++}
+diff --git a/pkg/maps/terwaymap/terway.go b/pkg/maps/terwaymap/terway.go
+index 2d0ede5e17..4021ae2e00 100644
+--- a/pkg/maps/terwaymap/terway.go
++++ b/pkg/maps/terwaymap/terway.go
+@@ -61,6 +61,9 @@ type Store struct {
+ 	backend  backend
+ 	bindings *ebpf.Map
+ 	stats    *ebpf.Map
++	// addresses is refreshed by successful transactions, including startup
++	// reconciliation. nil means unknown after an incomplete rollback.
++	addresses map[Key]uint32
+ }
+ 
+ func Open(logger *slog.Logger, restore bool) (*Store, error) {
+@@ -187,7 +190,39 @@ func (s *Store) Upsert(owner, ifindex, parent uint32, ips []netip.Addr, binding
+ }
+ 
+ func (s *Store) Delete(owner uint32) error {
+-	return s.transaction(func(next map[Key]Value) error { removeOwner(next, owner); return nil }, nil)
++	return s.DeleteWithPublish(owner, nil)
++}
++
++func (s *Store) DeleteWithPublish(owner uint32, publish func() error) error {
++	return s.transaction(func(next map[Key]Value) error { removeOwner(next, owner); return nil }, publish)
++}
++
++// DeleteAddress follows the LXC map's orphan-address GC. Keep the interface
++// binding while another address of the same dual-stack endpoint is alive.
++func (s *Store) DeleteAddress(parent uint32, addr netip.Addr, owner uint32, publish func() error) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	// Ordinary endpoint GC must not depend on a VLAN map transaction. Keep
++	// publication under the same lock so address reuse cannot race this check.
++	if cached, found := s.addresses[AddressKey(parent, addr)]; s.addresses != nil && (!found || cached != owner) {
++		if publish != nil {
++			return publish()
++		}
++		return nil
++	}
++	return s.transactionLocked(func(next map[Key]Value) error {
++		key := AddressKey(parent, addr)
++		if v, ok := next[key]; ok && v.Owner == owner {
++			delete(next, key)
++		}
++		for k, v := range next {
++			if v.Owner == owner && (k.Kind == IPv4 || k.Kind == IPv6) {
++				return nil
++			}
++		}
++		removeOwner(next, owner)
++		return nil
++	}, publish)
+ }
+ 
+ // Reconcile removes orphaned bindings using cilium_lxc as the source of live
+@@ -279,6 +314,19 @@ func (s *Store) apply(from, to map[Key]Value) error {
+ func (s *Store) transaction(change func(map[Key]Value) error, publish func() error) error {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
++	return s.transactionLocked(change, publish)
++}
++
++func (s *Store) rememberAddresses(entries map[Key]Value) {
++	s.addresses = make(map[Key]uint32)
++	for k, v := range entries {
++		if k.Kind == IPv4 || k.Kind == IPv6 {
++			s.addresses[k] = v.Owner
++		}
++	}
++}
++
++func (s *Store) transactionLocked(change func(map[Key]Value) error, publish func() error) error {
+ 	before, err := s.backend.snapshot()
+ 	if err != nil {
+ 		return err
+@@ -293,11 +341,17 @@ func (s *Store) transaction(change func(map[Key]Value) error, publish func() err
+ 		err = publish()
+ 	}
+ 	if err == nil {
++		s.rememberAddresses(next)
+ 		return nil
+ 	}
++	s.addresses = nil
+ 	current, snapshotErr := s.backend.snapshot()
+ 	if snapshotErr != nil {
+ 		return errors.Join(err, snapshotErr)
+ 	}
+-	return errors.Join(err, s.apply(current, before))
++	rollbackErr := s.apply(current, before)
++	if rollbackErr == nil {
++		s.rememberAddresses(before)
++	}
++	return errors.Join(err, rollbackErr)
+ }
+diff --git a/pkg/maps/terwaymap/terway_test.go b/pkg/maps/terwaymap/terway_test.go
+index 5828d9129e..802e860c9c 100644
+--- a/pkg/maps/terwaymap/terway_test.go
++++ b/pkg/maps/terwaymap/terway_test.go
+@@ -7,11 +7,13 @@ import (
+ 	"errors"
+ 	"maps"
+ 	"net/netip"
++	"sync"
+ 	"testing"
+ 	"unsafe"
+ 
+-	"github.com/cilium/cilium/pkg/terway"
+ 	"github.com/stretchr/testify/require"
++
++	"github.com/cilium/cilium/pkg/terway"
+ )
+ 
+ type memoryBackend struct {
+@@ -111,3 +113,67 @@ func TestParentIfindexReuse(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestOrphanAddressCleanup(t *testing.T) {
++	s, b := newTestStore()
++	require.NoError(t, s.Upsert(1, 11, 2, testIPs, testBinding, nil))
++	require.NoError(t, s.DeleteAddress(2, testIPs[0], 1, nil))
++	require.Contains(t, b.entries, Key{IfIndex: 11, Kind: Link})
++	require.NotContains(t, b.entries, AddressKey(2, testIPs[0]))
++	require.NoError(t, s.DeleteAddress(2, testIPs[1], 1, nil))
++	require.Empty(t, b.entries)
++}
++
++func TestDeletionRollback(t *testing.T) {
++	s, b := newTestStore()
++	require.NoError(t, s.Upsert(1, 11, 2, testIPs, testBinding, nil))
++	before := maps.Clone(b.entries)
++	require.Error(t, s.DeleteWithPublish(1, func() error { return errors.New("delete failed") }))
++	require.Equal(t, before, b.entries)
++}
++
++func TestConcurrentBindings(t *testing.T) {
++	s, b := newTestStore()
++	var wg sync.WaitGroup
++	for owner := uint32(1); owner <= 16; owner++ {
++		wg.Go(func() {
++			ip := netip.AddrFrom4([4]byte{10, 0, 1, byte(owner)})
++			if err := s.Upsert(owner, owner+100, 2, []netip.Addr{ip}, testBinding, nil); err != nil {
++				t.Error(err)
++			}
++		})
++	}
++	wg.Wait()
++	require.Len(t, b.entries, 33)
++	for owner := uint32(1); owner <= 16; owner++ {
++		wg.Go(func() {
++			if err := s.Delete(owner); err != nil {
++				t.Error(err)
++			}
++		})
++	}
++	wg.Wait()
++	require.Empty(t, b.entries)
++}
++
++// A valid ownership cache lets ordinary endpoint GC publish even when the
++// VLAN backend is unavailable. A trunk deletion must still access the map.
++type unavailableBackend struct{ backend }
++
++func (unavailableBackend) snapshot() (map[Key]Value, error) {
++	return nil, errors.New("VLAN backend unavailable")
++}
++
++func TestOrdinaryAddressGCDoesNotDependOnVLANMap(t *testing.T) {
++	s, b := newTestStore()
++	require.NoError(t, s.Upsert(1, 11, 2, testIPs, testBinding, nil))
++	s.backend = unavailableBackend{b}
++	published := 0
++	publish := func() error { published++; return nil }
++	require.NoError(t, s.DeleteAddress(2, netip.MustParseAddr("10.0.0.3"), 2, publish))
++	// A late delete of an ordinary address cannot touch a new trunk owner.
++	require.NoError(t, s.DeleteAddress(2, testIPs[0], 2, publish))
++	require.Equal(t, 2, published)
++	require.ErrorContains(t, s.DeleteAddress(2, testIPs[0], 1, publish), "unavailable")
++	require.Equal(t, 2, published)
++}
+diff --git a/pkg/option/config.go b/pkg/option/config.go
+index f5c7c2b3c4..5354ac8b55 100644
+--- a/pkg/option/config.go
++++ b/pkg/option/config.go
+@@ -2235,6 +2235,9 @@ func (c *DaemonConfig) Validate(vp *viper.Viper) error {
+ 		if len(c.VLANBPFBypass) != 0 {
+ 			return fmt.Errorf("%s cannot be combined with %s", EnableTerwayDatapath, VLANBPFBypass)
+ 		}
++		if c.EnableEgressGateway || (c.NodePortAcceleration != "" && c.NodePortAcceleration != NodePortAccelerationDisabled) {
++			return fmt.Errorf("%s does not support egress gateway or XDP acceleration", EnableTerwayDatapath)
++		}
+ 	}
+ 	if err := c.validateIPv6ClusterAllocCIDR(); err != nil {
+ 		return fmt.Errorf("unable to parse CIDR value '%s' of option --%s: %w",
+diff --git a/pkg/option/terway_test.go b/pkg/option/terway_test.go
+new file mode 100644
+index 0000000000..a31c170cfb
+--- /dev/null
++++ b/pkg/option/terway_test.go
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++package option
++
++import (
++	"testing"
++
++	"github.com/spf13/viper"
++	"github.com/stretchr/testify/require"
++)
++
++func TestTerwayRejectsUnsupportedDatapaths(t *testing.T) {
++	for _, tc := range []struct {
++		name      string
++		configure func(*DaemonConfig)
++		message   string
++	}{
++		{"overlay", func(c *DaemonConfig) { c.RoutingMode = RoutingModeTunnel }, "requires native routing"},
++		{"bypass", func(c *DaemonConfig) { c.VLANBPFBypass = []int{42} }, "cannot be combined"},
++		{"egress-gateway", func(c *DaemonConfig) { c.EnableEgressGateway = true }, "does not support"},
++		{"xdp", func(c *DaemonConfig) { c.NodePortAcceleration = NodePortAccelerationNative }, "does not support"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			c := &DaemonConfig{EnableTerwayDatapath: true, RoutingMode: RoutingModeNative}
++			tc.configure(c)
++			require.ErrorContains(t, c.Validate(viper.New()), tc.message)
++		})
++	}
++}
+diff --git a/pkg/terway/binding_test.go b/pkg/terway/binding_test.go
+index 683403ccb8..f6413206c8 100644
+--- a/pkg/terway/binding_test.go
++++ b/pkg/terway/binding_test.go
+@@ -4,8 +4,9 @@
+ package terway
+ 
+ import (
+-	"github.com/stretchr/testify/require"
+ 	"testing"
++
++	"github.com/stretchr/testify/require"
+ )
+ 
+ func TestBindingProperties(t *testing.T) {
+diff --git a/plugins/cilium-cni/chaining/terway/backend.go b/plugins/cilium-cni/chaining/terway/backend.go
+index c6636ac1ca..b0f52c632e 100644
+--- a/plugins/cilium-cni/chaining/terway/backend.go
++++ b/plugins/cilium-cni/chaining/terway/backend.go
+@@ -8,8 +8,6 @@ import (
+ 	"fmt"
+ 	"net/netip"
+ 
+-	"github.com/cilium/cilium/api/v1/models"
+-	contract "github.com/cilium/cilium/pkg/terway"
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/credentials/insecure"
+ 	"google.golang.org/protobuf/proto"
+@@ -17,6 +15,9 @@ import (
+ 	"google.golang.org/protobuf/reflect/protoreflect"
+ 	"google.golang.org/protobuf/types/descriptorpb"
+ 	"google.golang.org/protobuf/types/dynamicpb"
++
++	"github.com/cilium/cilium/api/v1/models"
++	contract "github.com/cilium/cilium/pkg/terway"
+ )
+ 
+ const backendSocket = "unix:///var/run/eni/eni.socket"
+diff --git a/plugins/cilium-cni/chaining/terway/backend_test.go b/plugins/cilium-cni/chaining/terway/backend_test.go
+index a4a4745673..b3a02d1172 100644
+--- a/plugins/cilium-cni/chaining/terway/backend_test.go
++++ b/plugins/cilium-cni/chaining/terway/backend_test.go
+@@ -5,6 +5,7 @@ package terway
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"net"
+ 	"path/filepath"
+ 	"testing"
+@@ -60,9 +61,9 @@ func TestQueryBinding(t *testing.T) {
+ 		if err := decode(req); err != nil {
+ 			return nil, err
+ 		}
+-		require.Equal(t, "pod", getField(req, 1).String())
+-		require.Equal(t, "ns", getField(req, 2).String())
+-		require.Equal(t, "sandbox", getField(req, 3).String())
++		if getField(req, 1).String() != "pod" || getField(req, 2).String() != "ns" || getField(req, 3).String() != "sandbox" {
++			return nil, fmt.Errorf("unexpected GetIPInfo request fields")
++		}
+ 		reply := dynamicpb.NewMessage(backendSchema.Messages().ByName("GetInfoReply"))
+ 		err := protojson.Unmarshal([]byte(`{"Success":true,"NetConfs":[{"BasicInfo":{"PodIP":{"IPv4":"10.0.0.2"}},"ENIInfo":{"MAC":"02:00:00:00:00:01","Trunk":true,"Vid":42}}]}`), reply)
+ 		return reply, err
+diff --git a/plugins/cilium-cni/chaining/terway/terway.go b/plugins/cilium-cni/chaining/terway/terway.go
+index faca9bd7b9..86a58c8c12 100644
+--- a/plugins/cilium-cni/chaining/terway/terway.go
++++ b/plugins/cilium-cni/chaining/terway/terway.go
+@@ -22,6 +22,7 @@ import (
+ 	"github.com/vishvananda/netlink"
+ 
+ 	"github.com/cilium/cilium/api/v1/models"
++	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
+ 	chainingapi "github.com/cilium/cilium/plugins/cilium-cni/chaining/api"
+ 	genericveth "github.com/cilium/cilium/plugins/cilium-cni/chaining/generic-veth"
+ )
+@@ -53,7 +54,7 @@ func configureEndpoint(ctx context.Context, p chainingapi.PluginContext, ep *mod
+ 	if binding.VLAN == 0 {
+ 		return fmt.Errorf("Terway trunk datapath requires a nonzero VLAN allocation")
+ 	}
+-	links, err := netlink.LinkList()
++	links, err := safenetlink.LinkList()
+ 	if err != nil {
+ 		return err
+ 	}

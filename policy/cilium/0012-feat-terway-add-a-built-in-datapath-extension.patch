@@ -1,0 +1,375 @@
+From 1c48845fbba9dbbd7a63453e67a752841396688b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=99=B6=E5=B0=BC?= <taoni.nt@alibaba-inc.com>
+Date: Mon, 23 Nov 2026 16:33:31 +0800
+Subject: [PATCH 12/16] feat(terway): add a built-in datapath extension
+
+---
+ bpf/bpf_terway.c                   |  20 +++++
+ daemon/cmd/daemon_main.go          |   2 +
+ pkg/datapath/loader/cell.go        |   1 +
+ pkg/datapath/loader/loader.go      |   2 +-
+ pkg/datapath/loader/terway.go      | 127 +++++++++++++++++++++++++++++
+ pkg/datapath/loader/terway_test.go |  36 ++++++++
+ pkg/datapath/plugins/cell.go       |   2 +-
+ pkg/datapath/plugins/registry.go   |  27 ++++++
+ pkg/option/config.go               |  12 +++
+ 9 files changed, 227 insertions(+), 2 deletions(-)
+ create mode 100644 bpf/bpf_terway.c
+ create mode 100644 pkg/datapath/loader/terway.go
+ create mode 100644 pkg/datapath/loader/terway_test.go
+
+diff --git a/bpf/bpf_terway.c b/bpf/bpf_terway.c
+new file mode 100644
+index 0000000000..ed5773f87f
+--- /dev/null
++++ b/bpf/bpf_terway.c
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/* Copyright Authors of Cilium */
++
++#include <bpf/ctx/skb.h>
++#include <bpf/section.h>
++
++/* -1 means continue the datapath plugin dispatcher, not TC_ACT_OK. */
++__section("freplace")
++int terway_ingress(struct __ctx_buff *ctx __maybe_unused)
++{
++	return -1;
++}
++
++__section("freplace")
++int terway_egress(struct __ctx_buff *ctx __maybe_unused, int ret __maybe_unused)
++{
++	return -1;
++}
++
++BPF_LICENSE("Dual BSD/GPL");
+diff --git a/daemon/cmd/daemon_main.go b/daemon/cmd/daemon_main.go
+index bbcae2824e..c2e743469e 100644
+--- a/daemon/cmd/daemon_main.go
++++ b/daemon/cmd/daemon_main.go
+@@ -820,6 +820,8 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
+ 	option.BindEnv(vp, option.EnableCiliumNodeCRDName)
+ 
+ 	flags.Bool(option.EnableDatapathPlugins, defaults.EnableDatapathPlugins, "Enable use of datapath plugins and the CiliumDatapathPlugins CRD")
++	flags.Bool(option.EnableTerwayDatapath, false, "Use the built-in Terway datapath plugin for trunk VLAN handling")
++	option.BindEnv(vp, option.EnableTerwayDatapath)
+ 	flags.MarkHidden(option.EnableDatapathPlugins)
+ 	option.BindEnv(vp, option.EnableDatapathPlugins)
+ 
+diff --git a/pkg/datapath/loader/cell.go b/pkg/datapath/loader/cell.go
+index 227e87bdde..692f34c00a 100644
+--- a/pkg/datapath/loader/cell.go
++++ b/pkg/datapath/loader/cell.go
+@@ -15,6 +15,7 @@ var Cell = cell.Module(
+ 
+ 	cell.Provide(NewLoader),
+ 	cell.Provide(NewCompilationLock),
++	cell.Provide(newTerwayPlugin),
+ )
+ 
+ // NewLoader returns a new loader.
+diff --git a/pkg/datapath/loader/loader.go b/pkg/datapath/loader/loader.go
+index 6fa42e12d5..93e2b69061 100644
+--- a/pkg/datapath/loader/loader.go
++++ b/pkg/datapath/loader/loader.go
+@@ -85,7 +85,7 @@ type Params struct {
+ func newLoader(p Params) *loader {
+ 	registerRouteInitializer(p)
+ 	collLoader := newBPFCollectionLoader(
+-		option.Config.EnableDatapathPlugins,
++		option.Config.EnableDatapathPlugins || option.Config.EnableTerwayDatapath,
+ 		bpffsPluginsOperationsDir(bpf.CiliumPath()),
+ 	)
+ 	collLoader.runGC(p.Logger, p.JobGroup)
+diff --git a/pkg/datapath/loader/terway.go b/pkg/datapath/loader/terway.go
+new file mode 100644
+index 0000000000..fc67911471
+--- /dev/null
++++ b/pkg/datapath/loader/terway.go
+@@ -0,0 +1,127 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++package loader
++
++import (
++	"context"
++	"fmt"
++	"log/slog"
++	"os"
++	"path/filepath"
++	"sync"
++
++	"github.com/cilium/ebpf"
++	"github.com/cilium/hive/cell"
++	"google.golang.org/grpc"
++
++	"github.com/cilium/cilium/api/v1/datapathplugins"
++	plugin "github.com/cilium/cilium/pkg/datapath/plugins/types"
++	api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
++	"github.com/cilium/cilium/pkg/option"
++)
++
++type terwayPluginOut struct {
++	cell.Out
++	Plugins []plugin.Plugin `group:"builtin-datapath-plugins,flatten"`
++}
++
++// The built-in client uses the same prepare/instrument protocol as an external
++// plugin, without a socket, CRD, or separate process. The registry exposes it
++// even when Kubernetes-managed datapath plugins are disabled.
++func newTerwayPlugin(logger *slog.Logger) terwayPluginOut {
++	if !option.Config.EnableTerwayDatapath {
++		return terwayPluginOut{}
++	}
++	return terwayPluginOut{Plugins: []plugin.Plugin{&terwayPlugin{logger: logger}}}
++}
++
++type terwayPlugin struct {
++	logger *slog.Logger
++	mu     sync.Mutex
++	spec   *ebpf.CollectionSpec
++}
++
++func (*terwayPlugin) Name() string { return "terway-vlan" }
++func (*terwayPlugin) AttachmentPolicy() api_v2alpha1.CiliumDatapathPluginAttachmentPolicy {
++	return api_v2alpha1.AttachmentPolicyAlways
++}
++func (p *terwayPlugin) DeepEqual(other plugin.Plugin) bool { return p == other }
++
++func (*terwayPlugin) PrepareCollection(_ context.Context, req *datapathplugins.PrepareCollectionRequest, _ ...grpc.CallOption) (*datapathplugins.PrepareCollectionResponse, error) {
++	resp := &datapathplugins.PrepareCollectionResponse{}
++	if req.GetAttachmentContext().GetHost() == nil {
++		return resp, nil
++	}
++	for _, hook := range []struct {
++		target string
++		kind   datapathplugins.HookType
++	}{
++		{"cil_from_netdev", datapathplugins.HookType_PRE},
++		{"cil_to_netdev", datapathplugins.HookType_POST},
++	} {
++		if _, ok := req.GetCollection().GetPrograms()[hook.target]; ok {
++			resp.Hooks = append(resp.Hooks, &datapathplugins.PrepareCollectionResponse_HookSpec{Target: hook.target, Type: hook.kind})
++		}
++	}
++	return resp, nil
++}
++
++func (p *terwayPlugin) collectionSpec(ctx context.Context) (*ebpf.CollectionSpec, error) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if p.spec == nil {
++		dir, err := os.MkdirTemp(option.Config.StateDir, "terway-datapath-")
++		if err != nil {
++			return nil, err
++		}
++		defer os.RemoveAll(dir)
++		object, err := compile(ctx, p.logger, &progInfo{Source: "bpf_terway.c", Output: "bpf_terway.o", OutputType: outputObject}, &directoryInfo{
++			Library: option.Config.BpfDir, Runtime: option.Config.StateDir,
++			State: option.Config.StateDir, Output: dir,
++		})
++		if err != nil {
++			return nil, err
++		}
++		p.spec, err = ebpf.LoadCollectionSpec(object)
++		if err != nil {
++			return nil, err
++		}
++	}
++	return p.spec.Copy(), nil
++}
++
++func (p *terwayPlugin) InstrumentCollection(ctx context.Context, req *datapathplugins.InstrumentCollectionRequest, _ ...grpc.CallOption) (*datapathplugins.InstrumentCollectionResponse, error) {
++	for _, hook := range req.GetHooks() {
++		spec, err := p.collectionSpec(ctx)
++		if err != nil {
++			return nil, fmt.Errorf("compile Terway datapath: %w", err)
++		}
++		name := "terway_ingress"
++		if hook.GetType() == datapathplugins.HookType_POST {
++			name = "terway_egress"
++		}
++		prog := spec.Programs[name]
++		if prog == nil {
++			return nil, fmt.Errorf("missing Terway hook %s", name)
++		}
++		target, err := ebpf.NewProgramFromID(ebpf.ProgramID(hook.GetAttachTarget().GetProgramId()))
++		if err != nil {
++			return nil, err
++		}
++		prog.AttachTarget = target
++		prog.AttachTo = hook.GetAttachTarget().GetSubprogName()
++		spec.Programs = map[string]*ebpf.ProgramSpec{name: prog}
++		coll, err := ebpf.NewCollection(spec)
++		target.Close()
++		if err != nil {
++			return nil, fmt.Errorf("load Terway hook %s: %w", name, err)
++		}
++		err = coll.Programs[name].Pin(filepath.Clean(hook.GetPinPath()))
++		coll.Close()
++		if err != nil {
++			return nil, err
++		}
++	}
++	return &datapathplugins.InstrumentCollectionResponse{}, nil
++}
+diff --git a/pkg/datapath/loader/terway_test.go b/pkg/datapath/loader/terway_test.go
+new file mode 100644
+index 0000000000..ca4471e6d0
+--- /dev/null
++++ b/pkg/datapath/loader/terway_test.go
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++package loader
++
++import (
++	"testing"
++
++	"github.com/cilium/cilium/api/v1/datapathplugins"
++	"github.com/stretchr/testify/require"
++)
++
++func TestTerwayHookSelection(t *testing.T) {
++	p := &terwayPlugin{}
++	for _, host := range []bool{false, true} {
++		req := &datapathplugins.PrepareCollectionRequest{Collection: &datapathplugins.PrepareCollectionRequest_CollectionSpec{
++			Programs: map[string]*datapathplugins.PrepareCollectionRequest_CollectionSpec_ProgramSpec{
++				"cil_from_netdev": {}, "cil_to_netdev": {}, "cil_host_policy": {},
++			},
++		}, AttachmentContext: &datapathplugins.AttachmentContext{}}
++		if host {
++			req.AttachmentContext.Context = &datapathplugins.AttachmentContext_Host_{Host: &datapathplugins.AttachmentContext_Host{}}
++		}
++		resp, err := p.PrepareCollection(t.Context(), req)
++		require.NoError(t, err)
++		if !host {
++			require.Empty(t, resp.Hooks)
++			continue
++		}
++		require.Len(t, resp.Hooks, 2)
++		require.Equal(t, "cil_from_netdev", resp.Hooks[0].Target)
++		require.Equal(t, datapathplugins.HookType_PRE, resp.Hooks[0].Type)
++		require.Equal(t, "cil_to_netdev", resp.Hooks[1].Target)
++		require.Equal(t, datapathplugins.HookType_POST, resp.Hooks[1].Type)
++	}
++}
+diff --git a/pkg/datapath/plugins/cell.go b/pkg/datapath/plugins/cell.go
+index c57704937d..16efdcfffa 100644
+--- a/pkg/datapath/plugins/cell.go
++++ b/pkg/datapath/plugins/cell.go
+@@ -30,7 +30,7 @@ var Cell = cell.Module(
+ 	cell.Config(defaultDatapathPluginsConfig),
+ 	cell.Provide(
+ 		statedb.RWTable[*api_v2alpha1.CiliumDatapathPlugin].ToTable,
+-		newRegistry,
++		provideRegistry,
+ 	),
+ 	cell.ProvidePrivate(
+ 		newDPPListerWatcher,
+diff --git a/pkg/datapath/plugins/registry.go b/pkg/datapath/plugins/registry.go
+index c7fe0af4b3..e1cda872d7 100644
+--- a/pkg/datapath/plugins/registry.go
++++ b/pkg/datapath/plugins/registry.go
+@@ -9,6 +9,8 @@ import (
+ 	"log/slog"
+ 	"path/filepath"
+ 
++	"github.com/cilium/hive/cell"
++
+ 	"github.com/cilium/cilium/api/v1/datapathplugins"
+ 	"github.com/cilium/cilium/pkg/datapath/plugins/types"
+ 	api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+@@ -47,6 +49,24 @@ type registry struct {
+ 	registry               map[string]*plugin
+ 	datapathPluginStateDir string
+ 	synced                 syncChan
++	builtins               types.Plugins
++}
++
++type registryParams struct {
++	cell.In
++	Logger   *slog.Logger
++	Synced   syncChan
++	Config   datapathPluginsConfig
++	Builtins []types.Plugin `group:"builtin-datapath-plugins"`
++}
++
++func provideRegistry(p registryParams) types.Registry {
++	r := newRegistry(p.Logger, p.Synced, p.Config).(*registry)
++	r.builtins = make(types.Plugins, len(p.Builtins))
++	for _, plugin := range p.Builtins {
++		r.builtins[plugin.Name()] = plugin
++	}
++	return r
+ }
+ 
+ func newRegistry(logger *slog.Logger, synced syncChan, config datapathPluginsConfig) types.Registry {
+@@ -88,6 +108,10 @@ func (r *registry) Register(datapathPlugin *api_v2alpha1.CiliumDatapathPlugin) {
+ 		logfields.CiliumDatapathPluginAttachmentPolicy, datapathPlugin.Spec.AttachmentPolicy,
+ 		logfields.CiliumDatapathPluginVersion, datapathPlugin.Spec.Version,
+ 	)
++	if _, reserved := r.builtins[datapathPlugin.Name]; reserved {
++		logger.Error("Cannot replace a built-in datapath plugin")
++		return
++	}
+ 
+ 	p, ok := r.registry[datapathPlugin.Name]
+ 	if ok {
+@@ -155,6 +179,9 @@ func (r *registry) Plugins() types.Plugins {
+ 	defer r.mu.Unlock()
+ 
+ 	snapshot := make(map[string]types.Plugin)
++	for name, plugin := range r.builtins {
++		snapshot[name] = plugin
++	}
+ 
+ 	for name, plugin := range r.registry {
+ 		cp := *plugin
+diff --git a/pkg/option/config.go b/pkg/option/config.go
+index 66cbe73f81..f5c7c2b3c4 100644
+--- a/pkg/option/config.go
++++ b/pkg/option/config.go
+@@ -991,6 +991,8 @@ const (
+ 
+ 	// EnableDatapathPlugins is the name of the option to enable datapath plugins.
+ 	EnableDatapathPlugins = "enable-datapath-plugins"
++	// EnableTerwayDatapath enables the built-in Terway VLAN datapath plugin.
++	EnableTerwayDatapath = "enable-terway-datapath"
+ 
+ 	// EnableInClusterLoadBalance enable short circuit for in cluster traffic to externalIP and loadBalancerIP
+ 	EnableInClusterLoadBalance = "enable-in-cluster-loadbalance"
+@@ -1892,6 +1894,7 @@ type DaemonConfig struct {
+ 
+ 	// Enables datapath plugins features.
+ 	EnableDatapathPlugins bool
++	EnableTerwayDatapath  bool
+ 
+ 	// EnableInClusterLoadBalance enable short circuit for in cluster traffic to externalIP and loadBalancerIP
+ 	EnableInClusterLoadBalance bool
+@@ -2225,6 +2228,14 @@ func (c *DaemonConfig) validateContainerIPLocalReservedPorts() error {
+ 
+ // Validate validates the daemon configuration
+ func (c *DaemonConfig) Validate(vp *viper.Viper) error {
++	if c.EnableTerwayDatapath {
++		if c.RoutingMode != RoutingModeNative {
++			return fmt.Errorf("%s requires native routing", EnableTerwayDatapath)
++		}
++		if len(c.VLANBPFBypass) != 0 {
++			return fmt.Errorf("%s cannot be combined with %s", EnableTerwayDatapath, VLANBPFBypass)
++		}
++	}
+ 	if err := c.validateIPv6ClusterAllocCIDR(); err != nil {
+ 		return fmt.Errorf("unable to parse CIDR value '%s' of option --%s: %w",
+ 			c.IPv6ClusterAllocCIDR, IPv6ClusterAllocCIDRName, err)
+@@ -2904,6 +2915,7 @@ func (c *DaemonConfig) Populate(logger *slog.Logger, vp *viper.Viper) {
+ 
+ 	// Enable datapath plugins.
+ 	c.EnableDatapathPlugins = vp.GetBool(EnableDatapathPlugins)
++	c.EnableTerwayDatapath = vp.GetBool(EnableTerwayDatapath)
+ }
+ 
+ func (c *DaemonConfig) PopulateEnableCiliumNodeCRD(logger *slog.Logger, vp *viper.Viper) {

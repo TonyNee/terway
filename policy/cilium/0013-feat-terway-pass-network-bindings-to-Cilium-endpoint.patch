@@ -1,0 +1,610 @@
+From 67a3b8500392279e3c93a02250993be18e331948 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=99=B6=E5=B0=BC?= <taoni.nt@alibaba-inc.com>
+Date: Mon, 23 Nov 2026 16:37:02 +0800
+Subject: [PATCH 13/16] feat(terway): pass network bindings to Cilium endpoints
+
+---
+ pkg/endpoint/api.go                           |   8 ++
+ pkg/terway/binding.go                         |  50 +++++++
+ pkg/terway/binding_test.go                    |  39 ++++++
+ .../chaining/generic-veth/generic-veth.go     |  48 +++++--
+ .../generic-veth/generic-veth_test.go         |  58 ++++++++
+ plugins/cilium-cni/chaining/terway/backend.go | 124 ++++++++++++++++++
+ .../chaining/terway/backend_test.go           |  84 ++++++++++++
+ plugins/cilium-cni/chaining/terway/terway.go  |  56 +++++++-
+ plugins/cilium-cni/types/types.go             |   2 +
+ 9 files changed, 454 insertions(+), 15 deletions(-)
+ create mode 100644 pkg/terway/binding.go
+ create mode 100644 pkg/terway/binding_test.go
+ create mode 100644 plugins/cilium-cni/chaining/generic-veth/generic-veth_test.go
+ create mode 100644 plugins/cilium-cni/chaining/terway/backend.go
+ create mode 100644 plugins/cilium-cni/chaining/terway/backend_test.go
+
+diff --git a/pkg/endpoint/api.go b/pkg/endpoint/api.go
+index 148a823616..3d9fe8dbb3 100644
+--- a/pkg/endpoint/api.go
++++ b/pkg/endpoint/api.go
+@@ -27,6 +27,7 @@ import (
+ 	"github.com/cilium/cilium/pkg/option"
+ 	"github.com/cilium/cilium/pkg/policy"
+ 	"github.com/cilium/cilium/pkg/policy/trafficdirection"
++	"github.com/cilium/cilium/pkg/terway"
+ 	"github.com/cilium/cilium/pkg/u8proto"
+ )
+ 
+@@ -154,6 +155,13 @@ func NewEndpointFromChangeModel(p EndpointParams, dnsRulesAPI DNSRulesAPI, proxy
+ 	if model.Properties != nil {
+ 		ep.properties = model.Properties
+ 	}
++	if option.Config.EnableTerwayDatapath && !ep.IsHost() {
++		if _, present, err := terway.ParseBinding(ep.GetPropertyValue); err != nil {
++			return nil, err
++		} else if !present {
++			return nil, fmt.Errorf("Terway datapath requires network binding properties from the Terway chainer")
++		}
++	}
+ 
+ 	if ep.parentIfIndex == 0 {
+ 		return nil, fmt.Errorf("parentIfIndex is 0")
+diff --git a/pkg/terway/binding.go b/pkg/terway/binding.go
+new file mode 100644
+index 0000000000..5f2d420b82
+--- /dev/null
++++ b/pkg/terway/binding.go
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++// Package terway contains the contract shared by the Terway CNI chainer and
++// Cilium's built-in Terway datapath extension.
++package terway
++
++import (
++	"fmt"
++	"net"
++	"strconv"
++)
++
++const (
++	PluginName        = "terway-vlan"
++	VLANProperty      = "terway-vlan-id"
++	ParentMACProperty = "terway-parent-mac"
++)
++
++// Binding is persisted in Endpoint properties, which are already part of the
++// normal Cilium endpoint restore format. A zero VLAN denotes an ordinary ENI.
++type Binding struct {
++	VLAN      uint16
++	ParentMAC string
++}
++
++func (b Binding) Properties() map[string]any {
++	return map[string]any{VLANProperty: strconv.FormatUint(uint64(b.VLAN), 10), ParentMACProperty: b.ParentMAC}
++}
++
++func ParseBinding(get func(string) any) (Binding, bool, error) {
++	raw := get(VLANProperty)
++	if raw == nil {
++		return Binding{}, false, nil
++	}
++	s, ok := raw.(string)
++	if !ok {
++		return Binding{}, true, fmt.Errorf("%s must be a decimal string", VLANProperty)
++	}
++	id, err := strconv.ParseUint(s, 10, 16)
++	if err != nil || id > 4094 {
++		return Binding{}, true, fmt.Errorf("invalid Terway VLAN ID %q", s)
++	}
++	mac, ok := get(ParentMACProperty).(string)
++	hw, err := net.ParseMAC(mac)
++	if !ok || err != nil || len(hw) != 6 || hw[0]&1 != 0 {
++		return Binding{}, true, fmt.Errorf("invalid Terway parent MAC %q", mac)
++	}
++	return Binding{VLAN: uint16(id), ParentMAC: hw.String()}, true, nil
++}
+diff --git a/pkg/terway/binding_test.go b/pkg/terway/binding_test.go
+new file mode 100644
+index 0000000000..683403ccb8
+--- /dev/null
++++ b/pkg/terway/binding_test.go
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++package terway
++
++import (
++	"github.com/stretchr/testify/require"
++	"testing"
++)
++
++func TestBindingProperties(t *testing.T) {
++	for _, id := range []uint16{0, 1, 4094} {
++		want := Binding{VLAN: id, ParentMAC: "02:00:00:00:00:01"}
++		props := want.Properties()
++		got, present, err := ParseBinding(func(k string) any { return props[k] })
++		require.NoError(t, err)
++		require.True(t, present)
++		require.Equal(t, want, got)
++	}
++	for _, raw := range []any{"-1", "4095", "65536", "abc", float64(1), 1} {
++		_, _, err := ParseBinding(func(k string) any {
++			if k == VLANProperty {
++				return raw
++			}
++			return "02:00:00:00:00:01"
++		})
++		require.Error(t, err)
++	}
++	_, present, err := ParseBinding(func(string) any { return nil })
++	require.NoError(t, err)
++	require.False(t, present)
++	_, _, err = ParseBinding(func(k string) any {
++		if k == VLANProperty {
++			return "1"
++		}
++		return "ff:ff:ff:ff:ff:ff"
++	})
++	require.Error(t, err)
++}
+diff --git a/plugins/cilium-cni/chaining/generic-veth/generic-veth.go b/plugins/cilium-cni/chaining/generic-veth/generic-veth.go
+index 9bcc8e083e..1bba213092 100644
+--- a/plugins/cilium-cni/chaining/generic-veth/generic-veth.go
++++ b/plugins/cilium-cni/chaining/generic-veth/generic-veth.go
+@@ -27,7 +27,18 @@ import (
+ 	"github.com/cilium/cilium/plugins/cilium-cni/types"
+ )
+ 
+-type GenericVethChainer struct{}
++type GenericVethChainer struct {
++	// UsesEndpointBinding selects interfaces that require provider metadata.
++	// All other interfaces retain the existing ENI inference and creation path.
++	UsesEndpointBinding func(netlink.Link) bool
++	// ConfigureEndpoint lets a chained provider supply authoritative network
++	// metadata before the endpoint is created. It must not modify shared state.
++	ConfigureEndpoint func(context.Context, chainingapi.PluginContext, *models.EndpointChangeRequest) error
++}
++
++func (f *GenericVethChainer) usesEndpointBinding(peer netlink.Link) bool {
++	return f.ConfigureEndpoint != nil && f.UsesEndpointBinding != nil && f.UsesEndpointBinding(peer)
++}
+ 
+ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.PluginContext, cli *client.Client) (res *cniTypesVer.Result, err error) {
+ 	err = cniVersion.ParsePrevResult(&pluginCtx.NetConf.NetConf)
+@@ -107,16 +118,7 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
+ 
+ 			addrsv6, err := safenetlink.AddrList(link, netlink.FAMILY_V6)
+ 			if err == nil && len(addrsv6) > 0 {
+-				if len(addrsv6) == 1 {
+-					vethIPv6 = addrsv6[0].IPNet.IP.String()
+-				} else {
+-					for _, addrv6 := range addrsv6 {
+-						if addrv6.IP.IsGlobalUnicast() {
+-							vethIPv6 = addrv6.IPNet.IP.String()
+-							break
+-						}
+-					}
+-				}
++				vethIPv6 = getGlobalIPv6Address(addrsv6)
+ 			} else if err != nil {
+ 				pluginCtx.Logger.Warn(
+ 					"No valid IPv6 address found",
+@@ -181,7 +183,11 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
+ 	hostMac = peer.Attrs().HardwareAddr.String()
+ 	vethHostName = peer.Attrs().Name
+ 	vethHostIdx = peer.Attrs().Index
+-	eniIndex := getEniInterfaceIndex(vethIP, vethIPv6)
++	var eniIndex int64
++	providerBinding := f.usesEndpointBinding(peer)
++	if !providerBinding {
++		eniIndex = getEniInterfaceIndex(vethIP, vethIPv6)
++	}
+ 
+ 	switch {
+ 	case vethHostName == "":
+@@ -196,7 +202,7 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
+ 	case vethHostIdx == 0:
+ 		err = errors.New("unable to determine index interface of veth pair on the host side")
+ 		return
+-	case eniIndex <= 0:
++	case eniIndex <= 0 && !providerBinding:
+ 		err = errors.New("unable to determine eni index of veth pair on the host side")
+ 		return
+ 	}
+@@ -240,6 +246,11 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
+ 		},
+ 		ParentInterfaceIndex: eniIndex,
+ 	}
++	if providerBinding {
++		if err := f.ConfigureEndpoint(ctx, pluginCtx, ep); err != nil {
++			return nil, fmt.Errorf("configure chained endpoint: %w", err)
++		}
++	}
+ 
+ 	scopedLogger := pluginCtx.Logger.With(
+ 		logfields.ContainerID, ep.ContainerID,
+@@ -372,3 +383,14 @@ func getGW(family int, table int) int {
+ 	}
+ 	return 0
+ }
++
++// getGlobalIPv6Address excludes link-local addresses, which can exist even on
++// IPv4-only pods and must not be used as the endpoint's allocated IPv6 address.
++func getGlobalIPv6Address(addrs []netlink.Addr) string {
++	for _, addr := range addrs {
++		if addr.IP.IsGlobalUnicast() {
++			return addr.IP.String()
++		}
++	}
++	return ""
++}
+diff --git a/plugins/cilium-cni/chaining/generic-veth/generic-veth_test.go b/plugins/cilium-cni/chaining/generic-veth/generic-veth_test.go
+new file mode 100644
+index 0000000000..32fbc2c096
+--- /dev/null
++++ b/plugins/cilium-cni/chaining/generic-veth/generic-veth_test.go
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++package genericveth
++
++import (
++	"context"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"github.com/vishvananda/netlink"
++
++	"github.com/cilium/cilium/api/v1/models"
++	chainingapi "github.com/cilium/cilium/plugins/cilium-cni/chaining/api"
++)
++
++func TestGetGlobalIPv6Address(t *testing.T) {
++	for _, tc := range []struct {
++		name      string
++		addresses []string
++		want      string
++	}{
++		{name: "no-ipv6"},
++		{name: "ipv4-only-link-local", addresses: []string{"fe80::1234/64"}},
++		{name: "multiple-link-local", addresses: []string{"fe80::1234/64", "fe80::5678/64"}},
++		{name: "loopback", addresses: []string{"::1/128"}},
++		{name: "unspecified", addresses: []string{"::/128"}},
++		{name: "multicast", addresses: []string{"ff02::1/128"}},
++		{name: "unique-local", addresses: []string{"fd00::2/128"}, want: "fd00::2"},
++		{name: "global", addresses: []string{"2001:db8::2/128"}, want: "2001:db8::2"},
++		{name: "dual-stack-link-local-first", addresses: []string{"fe80::1234/64", "fd00::2/128"}, want: "fd00::2"},
++		{name: "dual-stack-global-first", addresses: []string{"2001:db8::2/128", "fe80::1234/64"}, want: "2001:db8::2"},
++		{name: "first-global", addresses: []string{"fe80::1234/64", "fd00::2/128", "fd00::3/128"}, want: "fd00::2"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			var addrs []netlink.Addr
++			for _, ip := range tc.addresses {
++				addr, err := netlink.ParseAddr(ip)
++				require.NoError(t, err)
++				addrs = append(addrs, *addr)
++			}
++			require.Equal(t, tc.want, getGlobalIPv6Address(addrs))
++		})
++	}
++}
++
++func TestProviderBindingRequiresInterfaceSelection(t *testing.T) {
++	callback := func(context.Context, chainingapi.PluginContext, *models.EndpointChangeRequest) error { return nil }
++	for _, alias := range []string{"", "ordinary", "provider-trunk"} {
++		peer := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Alias: alias}}
++		chainer := &GenericVethChainer{ConfigureEndpoint: callback}
++		require.False(t, chainer.usesEndpointBinding(peer))
++		chainer.UsesEndpointBinding = func(link netlink.Link) bool { return link.Attrs().Alias == "provider-trunk" }
++		require.Equal(t, alias == "provider-trunk", chainer.usesEndpointBinding(peer))
++		chainer.ConfigureEndpoint = nil
++		require.False(t, chainer.usesEndpointBinding(peer))
++	}
++}
+diff --git a/plugins/cilium-cni/chaining/terway/backend.go b/plugins/cilium-cni/chaining/terway/backend.go
+new file mode 100644
+index 0000000000..c6636ac1ca
+--- /dev/null
++++ b/plugins/cilium-cni/chaining/terway/backend.go
+@@ -0,0 +1,124 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++package terway
++
++import (
++	"context"
++	"fmt"
++	"net/netip"
++
++	"github.com/cilium/cilium/api/v1/models"
++	contract "github.com/cilium/cilium/pkg/terway"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/credentials/insecure"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/reflect/protodesc"
++	"google.golang.org/protobuf/reflect/protoreflect"
++	"google.golang.org/protobuf/types/descriptorpb"
++	"google.golang.org/protobuf/types/dynamicpb"
++)
++
++const backendSocket = "unix:///var/run/eni/eni.socket"
++
++// This is the read-only subset of Terway's rpc/rpc.proto used by GetIPInfo.
++// Descriptors keep the normal protobuf codec and unknown-field compatibility,
++// without importing Terway's daemon and its dependency graph into cilium-cni.
++var backendSchema = func() protoreflect.FileDescriptor {
++	field := func(name string, number int32, typ descriptorpb.FieldDescriptorProto_Type, message string, repeated bool) *descriptorpb.FieldDescriptorProto {
++		f := &descriptorpb.FieldDescriptorProto{Name: proto.String(name), Number: proto.Int32(number), Type: &typ}
++		if message != "" {
++			f.TypeName = proto.String(".rpc." + message)
++		}
++		if repeated {
++			f.Label = descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum()
++		}
++		return f
++	}
++	str, msg := descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_TYPE_MESSAGE
++	boolean, u32 := descriptorpb.FieldDescriptorProto_TYPE_BOOL, descriptorpb.FieldDescriptorProto_TYPE_UINT32
++	desc, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
++		Name: proto.String("terway-get-ip-info.proto"), Package: proto.String("rpc"), Syntax: proto.String("proto3"),
++		MessageType: []*descriptorpb.DescriptorProto{
++			{Name: proto.String("GetInfoRequest"), Field: []*descriptorpb.FieldDescriptorProto{field("K8sPodName", 1, str, "", false), field("K8sPodNamespace", 2, str, "", false), field("K8sPodInfraContainerId", 3, str, "", false)}},
++			{Name: proto.String("IPSet"), Field: []*descriptorpb.FieldDescriptorProto{field("IPv4", 1, str, "", false), field("IPv6", 2, str, "", false)}},
++			{Name: proto.String("BasicInfo"), Field: []*descriptorpb.FieldDescriptorProto{field("PodIP", 1, msg, "IPSet", false)}},
++			{Name: proto.String("ENIInfo"), Field: []*descriptorpb.FieldDescriptorProto{field("MAC", 1, str, "", false), field("Trunk", 2, boolean, "", false), field("Vid", 3, u32, "", false)}},
++			{Name: proto.String("NetConf"), Field: []*descriptorpb.FieldDescriptorProto{field("BasicInfo", 1, msg, "BasicInfo", false), field("ENIInfo", 2, msg, "ENIInfo", false), field("IfName", 4, str, "", false)}},
++			{Name: proto.String("GetInfoReply"), Field: []*descriptorpb.FieldDescriptorProto{field("Success", 2, boolean, "", false), field("NetConfs", 5, msg, "NetConf", true), field("Error", 7, u32, "", false)}},
++		},
++	}, nil)
++	if err != nil {
++		panic(err)
++	}
++	return desc
++}()
++
++func getField(m protoreflect.Message, number protoreflect.FieldNumber) protoreflect.Value {
++	return m.Get(m.Descriptor().Fields().ByNumber(number))
++}
++
++func queryBinding(ctx context.Context, address, namespace, pod, sandbox, ifname string, ips *models.AddressPair) (contract.Binding, error) {
++	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
++	if err != nil {
++		return contract.Binding{}, err
++	}
++	defer conn.Close()
++	request := dynamicpb.NewMessage(backendSchema.Messages().ByName("GetInfoRequest"))
++	for i, s := range []string{pod, namespace, sandbox} {
++		request.Set(request.Descriptor().Fields().ByNumber(protoreflect.FieldNumber(i+1)), protoreflect.ValueOfString(s))
++	}
++	reply := dynamicpb.NewMessage(backendSchema.Messages().ByName("GetInfoReply"))
++	if err := conn.Invoke(ctx, "/rpc.TerwayBackend/GetIPInfo", request, reply); err != nil {
++		return contract.Binding{}, fmt.Errorf("query Terway network allocation: %w", err)
++	}
++	return bindingFromReply(reply, ifname, ips)
++}
++
++func bindingFromReply(reply protoreflect.Message, ifname string, ips *models.AddressPair) (contract.Binding, error) {
++	if !getField(reply, 2).Bool() || getField(reply, 7).Uint() != 0 || ips == nil || (ips.IPv4 == "" && ips.IPv6 == "") {
++		return contract.Binding{}, fmt.Errorf("Terway allocation is not ready")
++	}
++	var result contract.Binding
++	matches := 0
++	networks := getField(reply, 5).List()
++	for i := 0; i < networks.Len(); i++ {
++		n := networks.Get(i).Message()
++		name := getField(n, 4).String()
++		if name == "" {
++			name = "eth0"
++		}
++		if name != ifname {
++			continue
++		}
++		podIP := getField(getField(n, 1).Message(), 1).Message()
++		if ips.IPv4 != "" && !sameIP(getField(podIP, 1).String(), ips.IPv4) {
++			continue
++		}
++		if ips.IPv6 != "" && !sameIP(getField(podIP, 2).String(), ips.IPv6) {
++			continue
++		}
++		eni := getField(n, 2).Message()
++		vlan := getField(eni, 3).Uint()
++		if vlan > 4094 || (getField(eni, 2).Bool() && vlan == 0) || (!getField(eni, 2).Bool() && vlan != 0) {
++			return contract.Binding{}, fmt.Errorf("invalid Terway trunk/VLAN allocation")
++		}
++		props := (contract.Binding{VLAN: uint16(vlan), ParentMAC: getField(eni, 1).String()}).Properties()
++		var err error
++		result, _, err = contract.ParseBinding(func(k string) any { return props[k] })
++		if err != nil {
++			return contract.Binding{}, err
++		}
++		matches++
++	}
++	if matches != 1 {
++		return contract.Binding{}, fmt.Errorf("expected one Terway allocation for interface %s, found %d", ifname, matches)
++	}
++	return result, nil
++}
++
++func sameIP(a, b string) bool {
++	x, err := netip.ParseAddr(a)
++	y, otherErr := netip.ParseAddr(b)
++	return err == nil && otherErr == nil && x == y
++}
+diff --git a/plugins/cilium-cni/chaining/terway/backend_test.go b/plugins/cilium-cni/chaining/terway/backend_test.go
+new file mode 100644
+index 0000000000..a4a4745673
+--- /dev/null
++++ b/plugins/cilium-cni/chaining/terway/backend_test.go
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++package terway
++
++import (
++	"context"
++	"net"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"github.com/vishvananda/netlink"
++	"google.golang.org/grpc"
++	"google.golang.org/protobuf/encoding/protojson"
++	"google.golang.org/protobuf/types/dynamicpb"
++
++	"github.com/cilium/cilium/api/v1/models"
++	chainingapi "github.com/cilium/cilium/plugins/cilium-cni/chaining/api"
++	cnitypes "github.com/cilium/cilium/plugins/cilium-cni/types"
++)
++
++func TestBindingFromReply(t *testing.T) {
++	for _, tc := range []struct {
++		name, reply, ifname string
++		ips                 models.AddressPair
++		wantError           bool
++	}{
++		{"trunk", `{"Success":true,"NetConfs":[{"BasicInfo":{"PodIP":{"IPv4":"10.0.0.2"}},"ENIInfo":{"MAC":"02:00:00:00:00:01","Trunk":true,"Vid":42}}]}`, "eth0", models.AddressPair{IPv4: "10.0.0.2"}, false},
++		{"ipv6-secondary", `{"Success":true,"NetConfs":[{"IfName":"eth1","BasicInfo":{"PodIP":{"IPv6":"fd00::2"}},"ENIInfo":{"MAC":"02:00:00:00:00:01","Trunk":true,"Vid":42}}]}`, "eth1", models.AddressPair{IPv6: "fd00::2"}, false},
++		{"ordinary", `{"Success":true,"NetConfs":[{"BasicInfo":{"PodIP":{"IPv4":"10.0.0.2"}},"ENIInfo":{"MAC":"02:00:00:00:00:01"}}]}`, "eth0", models.AddressPair{IPv4: "10.0.0.2"}, false},
++		{"dual-stack", `{"Success":true,"NetConfs":[{"BasicInfo":{"PodIP":{"IPv4":"10.0.0.2","IPv6":"fd00::2"}},"ENIInfo":{"MAC":"02:00:00:00:00:01","Trunk":true,"Vid":42}}]}`, "eth0", models.AddressPair{IPv4: "10.0.0.2", IPv6: "fd00::2"}, false},
++		{"wrong-ipv6", `{"Success":true,"NetConfs":[{"BasicInfo":{"PodIP":{"IPv4":"10.0.0.2","IPv6":"fd00::2"}},"ENIInfo":{"MAC":"02:00:00:00:00:01","Trunk":true,"Vid":42}}]}`, "eth0", models.AddressPair{IPv4: "10.0.0.2", IPv6: "fd00::3"}, true},
++		{"unexpected-ipv6", `{"Success":true,"NetConfs":[{"BasicInfo":{"PodIP":{"IPv4":"10.0.0.2"}},"ENIInfo":{"MAC":"02:00:00:00:00:01","Trunk":true,"Vid":42}}]}`, "eth0", models.AddressPair{IPv4: "10.0.0.2", IPv6: "fd00::2"}, true},
++		{"old-sandbox", `{"Success":true}`, "eth0", models.AddressPair{IPv4: "10.0.0.2"}, true},
++		{"wrong-ip", `{"Success":true,"NetConfs":[{"BasicInfo":{"PodIP":{"IPv4":"10.0.0.3"}},"ENIInfo":{"MAC":"02:00:00:00:00:01"}}]}`, "eth0", models.AddressPair{IPv4: "10.0.0.2"}, true},
++		{"missing-vlan", `{"Success":true,"NetConfs":[{"BasicInfo":{"PodIP":{"IPv4":"10.0.0.2"}},"ENIInfo":{"MAC":"02:00:00:00:00:01","Trunk":true}}]}`, "eth0", models.AddressPair{IPv4: "10.0.0.2"}, true},
++		{"not-ready", `{"Success":false}`, "eth0", models.AddressPair{}, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			reply := dynamicpb.NewMessage(backendSchema.Messages().ByName("GetInfoReply"))
++			require.NoError(t, protojson.Unmarshal([]byte(tc.reply), reply))
++			_, err := bindingFromReply(reply, tc.ifname, &tc.ips)
++			if tc.wantError {
++				require.Error(t, err)
++			} else {
++				require.NoError(t, err)
++			}
++		})
++	}
++}
++
++func TestQueryBinding(t *testing.T) {
++	socket := filepath.Join(t.TempDir(), "backend.sock")
++	l, err := net.Listen("unix", socket)
++	require.NoError(t, err)
++	s := grpc.NewServer()
++	s.RegisterService(&grpc.ServiceDesc{ServiceName: "rpc.TerwayBackend", HandlerType: (*interface{})(nil), Methods: []grpc.MethodDesc{{MethodName: "GetIPInfo", Handler: func(_ any, _ context.Context, decode func(any) error, _ grpc.UnaryServerInterceptor) (any, error) {
++		req := dynamicpb.NewMessage(backendSchema.Messages().ByName("GetInfoRequest"))
++		if err := decode(req); err != nil {
++			return nil, err
++		}
++		require.Equal(t, "pod", getField(req, 1).String())
++		require.Equal(t, "ns", getField(req, 2).String())
++		require.Equal(t, "sandbox", getField(req, 3).String())
++		reply := dynamicpb.NewMessage(backendSchema.Messages().ByName("GetInfoReply"))
++		err := protojson.Unmarshal([]byte(`{"Success":true,"NetConfs":[{"BasicInfo":{"PodIP":{"IPv4":"10.0.0.2"}},"ENIInfo":{"MAC":"02:00:00:00:00:01","Trunk":true,"Vid":42}}]}`), reply)
++		return reply, err
++	}}}}, struct{}{})
++	go s.Serve(l)
++	t.Cleanup(s.Stop)
++	binding, err := queryBinding(t.Context(), "unix://"+socket, "ns", "pod", "sandbox", "eth0", &models.AddressPair{IPv4: "10.0.0.2"})
++	require.NoError(t, err)
++	require.Equal(t, uint16(42), binding.VLAN)
++}
++
++func TestOnlyTrunkVethUsesBackend(t *testing.T) {
++	for _, alias := range []string{"", "unrelated", trunkDatapathAlias + "-other"} {
++		require.False(t, usesTrunkBinding(&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Alias: alias}}))
++	}
++	require.True(t, usesTrunkBinding(&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Alias: trunkDatapathAlias}}))
++	p := chainingapi.PluginContext{NetConf: &cnitypes.NetConf{}}
++	require.ErrorContains(t, configureEndpoint(t.Context(), p, &models.EndpointChangeRequest{}), "requires terway-datapath")
++}
+diff --git a/plugins/cilium-cni/chaining/terway/terway.go b/plugins/cilium-cni/chaining/terway/terway.go
+index e140cb821f..faca9bd7b9 100644
+--- a/plugins/cilium-cni/chaining/terway/terway.go
++++ b/plugins/cilium-cni/chaining/terway/terway.go
+@@ -15,14 +15,66 @@
+ package terway
+ 
+ import (
++	"context"
++	"fmt"
++	"time"
++
++	"github.com/vishvananda/netlink"
++
++	"github.com/cilium/cilium/api/v1/models"
+ 	chainingapi "github.com/cilium/cilium/plugins/cilium-cni/chaining/api"
+ 	genericveth "github.com/cilium/cilium/plugins/cilium-cni/chaining/generic-veth"
+ )
+ 
+-var (
++const (
+ 	name = "terway-chainer"
++	// Shared with Terway's host-veth setup, without changing CNI result types.
++	trunkDatapathAlias = "terway-trunk-datapath"
+ )
+ 
+ func init() {
+-	chainingapi.Register(name, &genericveth.GenericVethChainer{})
++	chainingapi.Register(name, &genericveth.GenericVethChainer{UsesEndpointBinding: usesTrunkBinding, ConfigureEndpoint: configureEndpoint})
++}
++
++func usesTrunkBinding(peer netlink.Link) bool {
++	return peer.Attrs().Alias == trunkDatapathAlias
++}
++
++func configureEndpoint(ctx context.Context, p chainingapi.PluginContext, ep *models.EndpointChangeRequest) error {
++	if !p.NetConf.TerwayDatapath {
++		return fmt.Errorf("Terway trunk veth requires terway-datapath in the CNI configuration")
++	}
++	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
++	defer cancel()
++	binding, err := queryBinding(ctx, backendSocket, string(p.CniArgs.K8S_POD_NAMESPACE), string(p.CniArgs.K8S_POD_NAME), p.Args.ContainerID, p.Args.IfName, ep.Addressing)
++	if err != nil {
++		return err
++	}
++	if binding.VLAN == 0 {
++		return fmt.Errorf("Terway trunk datapath requires a nonzero VLAN allocation")
++	}
++	links, err := netlink.LinkList()
++	if err != nil {
++		return err
++	}
++	parent := 0
++	for _, link := range links {
++		if link.Attrs().HardwareAddr.String() == binding.ParentMAC {
++			if parent != 0 {
++				return fmt.Errorf("ambiguous parent ENI MAC %s", binding.ParentMAC)
++			}
++			parent = link.Attrs().Index
++		}
++	}
++	if parent == 0 {
++		return fmt.Errorf("parent ENI %s not found", binding.ParentMAC)
++	}
++	ep.ParentInterfaceIndex = int64(parent)
++	if ep.Properties == nil {
++		ep.Properties = map[string]any{}
++	}
++	for key, val := range binding.Properties() {
++		ep.Properties[key] = val
++	}
++	return nil
+ }
+diff --git a/plugins/cilium-cni/types/types.go b/plugins/cilium-cni/types/types.go
+index 0506e6a2e5..ad2ea50d36 100644
+--- a/plugins/cilium-cni/types/types.go
++++ b/plugins/cilium-cni/types/types.go
+@@ -32,6 +32,8 @@ type NetConf struct {
+ 	LogFormat      string                 `json:"log-format"`
+ 	LogFile        string                 `json:"log-file"`
+ 	ChainingMode   string                 `json:"chaining-mode"`
++	// TerwayDatapath must agree with the agent's enable-terway-datapath setting.
++	TerwayDatapath bool `json:"terway-datapath,omitempty"`
+ }
+ 
+ // IPAM is the Cilium specific CNI IPAM configuration

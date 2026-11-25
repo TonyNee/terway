@@ -1,0 +1,631 @@
+From 3f1814a0e8c948eca28c11faee18fd8d2119a171 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=99=B6=E5=B0=BC?= <taoni.nt@alibaba-inc.com>
+Date: Mon, 23 Nov 2026 16:44:01 +0800
+Subject: [PATCH 14/16] feat(terway): manage endpoint VLAN state in Cilium
+
+---
+ pkg/endpoint/restore.go           |  29 +++
+ pkg/maps/lxcmap/cell.go           |  22 ++-
+ pkg/maps/lxcmap/lxcmap.go         |  38 ++++
+ pkg/maps/terwaymap/terway.go      | 303 ++++++++++++++++++++++++++++++
+ pkg/maps/terwaymap/terway_test.go | 113 +++++++++++
+ 5 files changed, 504 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/maps/terwaymap/terway.go
+ create mode 100644 pkg/maps/terwaymap/terway_test.go
+
+diff --git a/pkg/endpoint/restore.go b/pkg/endpoint/restore.go
+index 6032d12cfa..0985841f72 100644
+--- a/pkg/endpoint/restore.go
++++ b/pkg/endpoint/restore.go
+@@ -30,6 +30,7 @@ import (
+ 	"github.com/cilium/cilium/pkg/mac"
+ 	"github.com/cilium/cilium/pkg/node"
+ 	"github.com/cilium/cilium/pkg/option"
++	"github.com/cilium/cilium/pkg/terway"
+ 	"github.com/cilium/cilium/pkg/time"
+ )
+ 
+@@ -553,6 +554,34 @@ func (ep *Endpoint) UnmarshalJSON(raw []byte) error {
+ 	}
+ 
+ 	ep.fromSerializedEndpoint(restoredEp)
++	if option.Config.EnableTerwayDatapath && !ep.IsHost() {
++		binding, present, err := terway.ParseBinding(ep.GetPropertyValue)
++		if err != nil {
++			return err
++		}
++		// Ordinary endpoints have no VLAN binding and retain their serialized
++		// parent interface. Only trunk endpoints need MAC-based restoration.
++		if !present || binding.VLAN == 0 {
++			return nil
++		}
++		links, err := safenetlink.LinkList()
++		if err != nil {
++			return err
++		}
++		parent := 0
++		for _, link := range links {
++			if link.Attrs().HardwareAddr.String() == binding.ParentMAC {
++				if parent != 0 {
++					return fmt.Errorf("ambiguous restored Terway parent ENI")
++				}
++				parent = link.Attrs().Index
++			}
++		}
++		if parent == 0 {
++			return fmt.Errorf("restored Terway parent ENI not found")
++		}
++		ep.parentIfIndex = parent
++	}
+ 	return nil
+ }
+ 
+diff --git a/pkg/maps/lxcmap/cell.go b/pkg/maps/lxcmap/cell.go
+index 00346cb971..7b481b20a6 100644
+--- a/pkg/maps/lxcmap/cell.go
++++ b/pkg/maps/lxcmap/cell.go
+@@ -5,10 +5,12 @@ package lxcmap
+ 
+ import (
+ 	"fmt"
++	"log/slog"
+ 
+ 	"github.com/cilium/hive/cell"
+ 
+ 	"github.com/cilium/cilium/pkg/bpf"
++	"github.com/cilium/cilium/pkg/maps/terwaymap"
+ 	"github.com/cilium/cilium/pkg/metrics"
+ 	"github.com/cilium/cilium/pkg/option"
+ )
+@@ -21,7 +23,7 @@ var Cell = cell.Module(
+ 	cell.Provide(newLXCMap),
+ )
+ 
+-func newLXCMap(lifecycle cell.Lifecycle, registry *metrics.Registry) bpf.MapOut[Map] {
++func newLXCMap(lifecycle cell.Lifecycle, registry *metrics.Registry, logger *slog.Logger) bpf.MapOut[Map] {
+ 	lxcMap := newMap(registry)
+ 
+ 	lifecycle.Append(cell.Hook{
+@@ -37,6 +39,24 @@ func newLXCMap(lifecycle cell.Lifecycle, registry *metrics.Registry) bpf.MapOut[
+ 					return fmt.Errorf("failed to delete all entries in lxc map: %w", err)
+ 				}
+ 			}
++			if option.Config.EnableTerwayDatapath {
++				var err error
++				lxcMap.terway, err = terwaymap.Open(logger, option.Config.RestoreState)
++				if err != nil {
++					return err
++				}
++				if err := lxcMap.terway.Reconcile(func(k terwaymap.Key, v terwaymap.Value) bool {
++					ep, err := lxcMap.bpfMap.Lookup(newEndpointKey(k.Addr()))
++					if err != nil {
++						return false
++					}
++					info := ep.(*EndpointInfo)
++					return uint32(info.LxcID) == v.Owner && info.ParentIfIndex == v.Parent
++				}); err != nil {
++					lxcMap.terway.Close()
++					return err
++				}
++			}
+ 
+ 			return nil
+ 		},
+diff --git a/pkg/maps/lxcmap/lxcmap.go b/pkg/maps/lxcmap/lxcmap.go
+index dd8ee466e3..dda729e1dc 100644
+--- a/pkg/maps/lxcmap/lxcmap.go
++++ b/pkg/maps/lxcmap/lxcmap.go
+@@ -4,19 +4,23 @@
+ package lxcmap
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"log/slog"
+ 	"net/netip"
+ 
+ 	"github.com/cilium/ebpf"
++	"github.com/vishvananda/netlink"
+ 	"golang.org/x/sys/unix"
+ 
+ 	"github.com/cilium/cilium/pkg/bpf"
+ 	eptypes "github.com/cilium/cilium/pkg/endpoint/types"
+ 	"github.com/cilium/cilium/pkg/identity"
+ 	"github.com/cilium/cilium/pkg/mac"
++	"github.com/cilium/cilium/pkg/maps/terwaymap"
+ 	"github.com/cilium/cilium/pkg/metrics"
+ 	"github.com/cilium/cilium/pkg/option"
++	"github.com/cilium/cilium/pkg/terway"
+ )
+ 
+ const (
+@@ -53,6 +57,7 @@ type Map interface {
+ 
+ type lxcMap struct {
+ 	bpfMap *bpf.Map
++	terway *terwaymap.Store
+ }
+ 
+ func newMap(registry *metrics.Registry) *lxcMap {
+@@ -90,6 +95,9 @@ func (m *lxcMap) init() error {
+ }
+ 
+ func (m *lxcMap) close() error {
++	if m.terway != nil {
++		return errors.Join(m.terway.Close(), m.bpfMap.Close())
++	}
+ 	if err := m.bpfMap.Close(); err != nil {
+ 		return fmt.Errorf("failed to close bpf map: %w", err)
+ 	}
+@@ -250,6 +258,31 @@ func (m *lxcMap) WriteEndpoint(f EndpointFrontend) error {
+ 		return err
+ 	}
+ 
++	publish := func() error { return m.writeEndpoint(f, info) }
++	if m.terway != nil && !f.IsAtHostNS() {
++		getter, ok := f.(interface{ GetPropertyValue(string) any })
++		if ok {
++			binding, present, err := terway.ParseBinding(getter.GetPropertyValue)
++			if err != nil {
++				return err
++			}
++			if !present {
++				return fmt.Errorf("missing Terway endpoint binding")
++			}
++			parent, err := netlink.LinkByIndex(f.GetParentIfIndex())
++			if err != nil {
++				return fmt.Errorf("resolve Terway parent ENI: %w", err)
++			}
++			if parent.Attrs().HardwareAddr.String() != binding.ParentMAC {
++				return fmt.Errorf("Terway parent ENI identity changed")
++			}
++			return m.terway.Upsert(uint32(f.GetID()), uint32(f.GetIfIndex()), uint32(f.GetParentIfIndex()), []netip.Addr{f.IPv4Address(), f.IPv6Address()}, binding, publish)
++		}
++	}
++	return publish()
++}
++
++func (m *lxcMap) writeEndpoint(f EndpointFrontend, info *EndpointInfo) error {
+ 	keys := m.getBPFKeys(f)
+ 	var writtenKeys []*EndpointKey
+ 
+@@ -291,6 +324,11 @@ func (m *lxcMap) DeleteEntry(addr netip.Addr) error {
+ 
+ func (m *lxcMap) DeleteElement(logger *slog.Logger, f EndpointFrontend) []error {
+ 	var errors []error
++	if m.terway != nil {
++		if err := m.terway.Delete(uint32(f.GetID())); err != nil {
++			errors = append(errors, err)
++		}
++	}
+ 	for _, k := range m.getBPFKeys(f) {
+ 		if err := m.bpfMap.Delete(k); err != nil {
+ 			errors = append(errors, fmt.Errorf("unable to delete key %v from %s: %w", k, bpf.MapPath(logger, mapName), err))
+diff --git a/pkg/maps/terwaymap/terway.go b/pkg/maps/terwaymap/terway.go
+new file mode 100644
+index 0000000000..2d0ede5e17
+--- /dev/null
++++ b/pkg/maps/terwaymap/terway.go
+@@ -0,0 +1,303 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++package terwaymap
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"log/slog"
++	"maps"
++	"net"
++	"net/netip"
++	"os"
++	"sort"
++	"sync"
++
++	"github.com/cilium/ebpf"
++	"golang.org/x/sys/unix"
++
++	"github.com/cilium/cilium/pkg/bpf"
++	"github.com/cilium/cilium/pkg/terway"
++)
++
++const (
++	MapName      = "cilium_twvlan"
++	StatsMapName = "cilium_twstats"
++	MaxEntries   = 262144
++	Parent       = 0
++	Link         = 1
++	IPv4         = 4
++	IPv6         = 6
++)
++
++// Key and Value are shared with bpf/lib/terway.h. Parent entries identify
++// managed NICs; link entries preserve endpoint identity across NAT; address
++// entries handle host-originated packets using a Pod source address.
++type Key struct {
++	IfIndex uint32
++	Kind    uint32
++	Address [16]byte
++}
++
++type Value struct {
++	Parent uint32
++	Owner  uint32
++	VLAN   uint16
++	Pad    uint16
++	MAC    [6]byte
++	Pad2   uint16
++}
++
++type backend interface {
++	snapshot() (map[Key]Value, error)
++	put(Key, Value) error
++	del(Key) error
++}
++
++type Store struct {
++	mu       sync.Mutex
++	backend  backend
++	bindings *ebpf.Map
++	stats    *ebpf.Map
++}
++
++func Open(logger *slog.Logger, restore bool) (*Store, error) {
++	open := func(spec *ebpf.MapSpec) (*ebpf.Map, error) {
++		path := bpf.MapPath(logger, spec.Name)
++		m, err := ebpf.LoadPinnedMap(path, nil)
++		if err == nil {
++			if err := spec.Compatible(m); err != nil {
++				m.Close()
++				return nil, err
++			}
++			return m, nil
++		}
++		if !errors.Is(err, os.ErrNotExist) {
++			return nil, err
++		}
++		m, err = ebpf.NewMap(spec)
++		if err != nil {
++			return nil, err
++		}
++		if err := m.Pin(path); err != nil {
++			m.Close()
++			return nil, err
++		}
++		return m, nil
++	}
++	m, err := open(&ebpf.MapSpec{Name: MapName, Type: ebpf.Hash, KeySize: 24, ValueSize: 20, MaxEntries: MaxEntries, Flags: unix.BPF_F_RDONLY_PROG})
++	if err != nil {
++		return nil, fmt.Errorf("open Terway bindings: %w", err)
++	}
++	stats, err := open(&ebpf.MapSpec{Name: StatsMapName, Type: ebpf.PerCPUArray, KeySize: 4, ValueSize: 8, MaxEntries: 8})
++	if err != nil {
++		m.Close()
++		return nil, err
++	}
++	s := &Store{bindings: m, stats: stats, backend: kernelBackend{m}}
++	if !restore {
++		if err := s.Reconcile(func(Key, Value) bool { return false }); err != nil {
++			s.Close()
++			return nil, err
++		}
++	}
++	return s, nil
++}
++
++func (s *Store) Close() error { return errors.Join(s.bindings.Close(), s.stats.Close()) }
++
++type kernelBackend struct{ m *ebpf.Map }
++
++func (b kernelBackend) snapshot() (map[Key]Value, error) {
++	entries := map[Key]Value{}
++	var k Key
++	var v Value
++	it := b.m.Iterate()
++	for it.Next(&k, &v) {
++		entries[k] = v
++	}
++	return entries, it.Err()
++}
++func (b kernelBackend) put(k Key, v Value) error { return b.m.Update(k, v, ebpf.UpdateAny) }
++func (b kernelBackend) del(k Key) error {
++	err := b.m.Delete(k)
++	if errors.Is(err, ebpf.ErrKeyNotExist) {
++		return nil
++	}
++	return err
++}
++
++func AddressKey(parent uint32, addr netip.Addr) Key {
++	k := Key{IfIndex: parent}
++	if addr.Is4() {
++		k.Kind = IPv4
++		ip := addr.As4()
++		copy(k.Address[:], ip[:])
++	} else {
++		k.Kind = IPv6
++		k.Address = addr.As16()
++	}
++	return k
++}
++
++func (k Key) Addr() netip.Addr {
++	if k.Kind == IPv4 {
++		return netip.AddrFrom4([4]byte(k.Address[:4]))
++	}
++	return netip.AddrFrom16(k.Address)
++}
++
++// Upsert publishes bindings before exposing the endpoint in cilium_lxc. A
++// publication error restores the previous binding set while holding the same
++// lock, so a concurrent endpoint cannot be rolled back accidentally.
++func (s *Store) Upsert(owner, ifindex, parent uint32, ips []netip.Addr, binding terway.Binding, publish func() error) error {
++	if owner == 0 || ifindex == 0 || parent == 0 {
++		return fmt.Errorf("invalid Terway endpoint identity")
++	}
++	return s.transaction(func(next map[Key]Value) error {
++		removeOwner(next, owner)
++		if binding.VLAN == 0 {
++			return nil
++		}
++		if binding.VLAN > 4094 {
++			return fmt.Errorf("invalid Terway VLAN %d", binding.VLAN)
++		}
++		hw, err := net.ParseMAC(binding.ParentMAC)
++		if err != nil || len(hw) != 6 {
++			return fmt.Errorf("invalid Terway parent MAC")
++		}
++		v := Value{Parent: parent, Owner: owner, VLAN: binding.VLAN}
++		copy(v.MAC[:], hw)
++		// A recycled ifindex must not retain bindings for the old NIC.
++		for k, old := range next {
++			if old.Parent == parent && old.MAC != v.MAC {
++				delete(next, k)
++			}
++		}
++		next[Key{IfIndex: ifindex, Kind: Link}] = v
++		for _, ip := range ips {
++			if ip.IsValid() {
++				next[AddressKey(parent, ip)] = v
++			}
++		}
++		return nil
++	}, publish)
++}
++
++func (s *Store) Delete(owner uint32) error {
++	return s.transaction(func(next map[Key]Value) error { removeOwner(next, owner); return nil }, nil)
++}
++
++// Reconcile removes orphaned bindings using cilium_lxc as the source of live
++// endpoint identities. It runs after the pinned LXC map has been opened.
++func (s *Store) Reconcile(alive func(Key, Value) bool) error {
++	return s.transaction(func(next map[Key]Value) error {
++		live := map[uint32]bool{}
++		for k, v := range next {
++			if k.Kind == IPv4 || k.Kind == IPv6 {
++				if alive(k, v) {
++					live[v.Owner] = true
++				} else {
++					delete(next, k)
++				}
++			}
++		}
++		for k, v := range next {
++			if k.Kind != Parent && !live[v.Owner] {
++				delete(next, k)
++			}
++		}
++		return nil
++	}, nil)
++}
++
++func removeOwner(entries map[Key]Value, owner uint32) {
++	for k, v := range entries {
++		if k.Kind != Parent && v.Owner == owner {
++			delete(entries, k)
++		}
++	}
++}
++
++func parents(entries map[Key]Value) {
++	for k := range entries {
++		if k.Kind == Parent {
++			delete(entries, k)
++		}
++	}
++	for k, v := range entries {
++		if k.Kind == Link {
++			v.Owner = 0
++			v.VLAN = 0
++			entries[Key{IfIndex: v.Parent, Kind: Parent}] = v
++		}
++	}
++}
++
++func ordered(entries map[Key]Value) []Key {
++	keys := make([]Key, 0, len(entries))
++	for k := range entries {
++		keys = append(keys, k)
++	}
++	sort.Slice(keys, func(i, j int) bool {
++		a, b := keys[i], keys[j]
++		if (a.Kind == Parent) != (b.Kind == Parent) {
++			return a.Kind != Parent
++		}
++		if a.IfIndex != b.IfIndex {
++			return a.IfIndex < b.IfIndex
++		}
++		if a.Kind != b.Kind {
++			return a.Kind < b.Kind
++		}
++		return bytes.Compare(a.Address[:], b.Address[:]) < 0
++	})
++	return keys
++}
++
++func (s *Store) apply(from, to map[Key]Value) error {
++	for _, k := range ordered(to) {
++		v := to[k]
++		if old, ok := from[k]; !ok || old != v {
++			if err := s.backend.put(k, v); err != nil {
++				return err
++			}
++		}
++	}
++	for _, k := range ordered(from) {
++		if _, ok := to[k]; !ok {
++			if err := s.backend.del(k); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func (s *Store) transaction(change func(map[Key]Value) error, publish func() error) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	before, err := s.backend.snapshot()
++	if err != nil {
++		return err
++	}
++	next := maps.Clone(before)
++	if err := change(next); err != nil {
++		return err
++	}
++	parents(next)
++	err = s.apply(before, next)
++	if err == nil && publish != nil {
++		err = publish()
++	}
++	if err == nil {
++		return nil
++	}
++	current, snapshotErr := s.backend.snapshot()
++	if snapshotErr != nil {
++		return errors.Join(err, snapshotErr)
++	}
++	return errors.Join(err, s.apply(current, before))
++}
+diff --git a/pkg/maps/terwaymap/terway_test.go b/pkg/maps/terwaymap/terway_test.go
+new file mode 100644
+index 0000000000..5828d9129e
+--- /dev/null
++++ b/pkg/maps/terwaymap/terway_test.go
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright Authors of Cilium
++
++package terwaymap
++
++import (
++	"errors"
++	"maps"
++	"net/netip"
++	"testing"
++	"unsafe"
++
++	"github.com/cilium/cilium/pkg/terway"
++	"github.com/stretchr/testify/require"
++)
++
++type memoryBackend struct {
++	entries       map[Key]Value
++	failAt, calls int
++}
++
++func (b *memoryBackend) snapshot() (map[Key]Value, error) { return maps.Clone(b.entries), nil }
++func (b *memoryBackend) put(k Key, v Value) error {
++	b.calls++
++	if b.calls == b.failAt {
++		return errors.New("map update failure")
++	}
++	b.entries[k] = v
++	return nil
++}
++func (b *memoryBackend) del(k Key) error { delete(b.entries, k); return nil }
++
++func newTestStore() (*Store, *memoryBackend) {
++	b := &memoryBackend{entries: map[Key]Value{}}
++	return &Store{backend: b}, b
++}
++
++var testBinding = terway.Binding{VLAN: 42, ParentMAC: "02:00:00:00:00:01"}
++var testIPs = []netip.Addr{netip.MustParseAddr("10.0.0.2"), netip.MustParseAddr("fd00::2")}
++
++func TestMapABI(t *testing.T) {
++	require.Equal(t, uintptr(24), unsafe.Sizeof(Key{}))
++	require.Equal(t, uintptr(20), unsafe.Sizeof(Value{}))
++	for _, ip := range testIPs {
++		require.Equal(t, ip, AddressKey(2, ip).Addr())
++	}
++}
++
++func TestEndpointLifecycle(t *testing.T) {
++	s, b := newTestStore()
++	for range 2 {
++		require.NoError(t, s.Upsert(1, 11, 2, testIPs, testBinding, nil))
++	}
++	require.Len(t, b.entries, 4)
++	require.Equal(t, uint16(42), b.entries[Key{IfIndex: 11, Kind: Link}].VLAN)
++	require.NoError(t, s.Delete(1))
++	require.Empty(t, b.entries)
++	require.NoError(t, s.Delete(1))
++}
++
++func TestIPReuseAndLateDelete(t *testing.T) {
++	s, b := newTestStore()
++	require.NoError(t, s.Upsert(1, 11, 2, testIPs, testBinding, nil))
++	other := testBinding
++	other.VLAN = 43
++	require.NoError(t, s.Upsert(2, 12, 2, testIPs, other, nil))
++	require.NoError(t, s.Delete(1))
++	for _, ip := range testIPs {
++		require.Equal(t, uint32(2), b.entries[AddressKey(2, ip)].Owner)
++	}
++	require.Equal(t, uint16(43), b.entries[Key{IfIndex: 12, Kind: Link}].VLAN)
++	require.Contains(t, b.entries, Key{IfIndex: 2, Kind: Parent})
++}
++
++func TestPublicationRollback(t *testing.T) {
++	s, b := newTestStore()
++	require.NoError(t, s.Upsert(1, 11, 2, testIPs, testBinding, nil))
++	before := maps.Clone(b.entries)
++	err := s.Upsert(2, 12, 2, testIPs, testBinding, func() error { return errors.New("LXC publication failed") })
++	require.ErrorContains(t, err, "publication failed")
++	require.Equal(t, before, b.entries)
++}
++
++func TestMapWriteRollback(t *testing.T) {
++	s, b := newTestStore()
++	b.failAt = 2
++	err := s.Upsert(1, 11, 2, testIPs, testBinding, nil)
++	require.Error(t, err)
++	require.Empty(t, b.entries)
++}
++
++func TestRestoreReconciliation(t *testing.T) {
++	s, b := newTestStore()
++	require.NoError(t, s.Upsert(1, 11, 2, testIPs, testBinding, nil))
++	require.NoError(t, s.Upsert(2, 12, 3, []netip.Addr{netip.MustParseAddr("10.0.0.3")}, testBinding, nil))
++	require.NoError(t, s.Reconcile(func(k Key, v Value) bool { return v.Owner == 1 && k.Kind == IPv6 }))
++	require.Len(t, b.entries, 3)
++	require.NotContains(t, b.entries, AddressKey(2, testIPs[0]))
++	require.NotContains(t, b.entries, Key{IfIndex: 3, Kind: Parent})
++	require.Contains(t, b.entries, Key{IfIndex: 11, Kind: Link})
++}
++
++func TestParentIfindexReuse(t *testing.T) {
++	s, b := newTestStore()
++	require.NoError(t, s.Upsert(1, 11, 2, testIPs, testBinding, nil))
++	replacement := terway.Binding{VLAN: 43, ParentMAC: "02:00:00:00:00:02"}
++	require.NoError(t, s.Upsert(2, 12, 2, []netip.Addr{netip.MustParseAddr("10.0.0.3")}, replacement, nil))
++	for k, v := range b.entries {
++		if k.Kind != Parent {
++			require.Equal(t, uint32(2), v.Owner)
++		}
++	}
++}
