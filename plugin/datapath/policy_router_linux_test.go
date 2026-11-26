@@ -22,6 +22,19 @@ import (
 )
 
 func TestDataPathPolicyRoute(t *testing.T) {
+	testPolicyRouteVLAN(t, false, false)
+}
+
+func TestDataPathPolicyRouteLegacyVLAN(t *testing.T) {
+	testPolicyRouteVLAN(t, true, false)
+}
+
+func TestDataPathPolicyRouteCiliumVLAN(t *testing.T) {
+	testPolicyRouteVLAN(t, true, true)
+}
+
+func testPolicyRouteVLAN(t *testing.T, trunk, ciliumDatapath bool) {
+	t.Helper()
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -72,7 +85,13 @@ func TestDataPathPolicyRoute(t *testing.T) {
 		},
 		MTU:            1499,
 		ENIIndex:       eni.Attrs().Index,
-		StripVlan:      false,
+		StripVlan:      trunk,
+		Vid:            100,
+		CiliumDatapath: ciliumDatapath,
+		ENIGatewayIP: &terwayTypes.IPSet{
+			IPv4: net.ParseIP("169.20.20.1"),
+			IPv6: net.ParseIP("fd00:20::1"),
+		},
 		ExtraRoutes:    nil,
 		ServiceCIDR:    nil,
 		HostStackCIDRs: nil,
@@ -89,6 +108,43 @@ func TestDataPathPolicyRoute(t *testing.T) {
 
 	err = d.Setup(context.Background(), cfg, containerNS)
 	assert.NoError(t, err)
+	hostVeth, err := netlink.LinkByName(cfg.HostVETHName)
+	assert.NoError(t, err)
+	if trunk && ciliumDatapath {
+		assert.Equal(t, types.TerwayTrunkDatapathAlias, hostVeth.Attrs().Alias)
+	} else {
+		assert.Empty(t, hostVeth.Attrs().Alias)
+	}
+	legacy, err := utils.LegacyVLANFilters(eni)
+	assert.NoError(t, err)
+	if trunk && !ciliumDatapath {
+		assert.Len(t, legacy, 3)
+		cfg.CiliumDatapath = true
+		assert.ErrorContains(t, d.Setup(context.Background(), cfg, containerNS), "legacy VLAN TC filters")
+		cfg.CiliumDatapath = false
+	} else {
+		assert.Empty(t, legacy)
+	}
+	if trunk {
+		// DP must preserve the trunk ENI gateway instead of using the pod's
+		// member ENI gateway when configuring the parent routing table.
+		for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+			routes, err := netlink.RouteListFiltered(family, &netlink.Route{Table: utils.GetRouteTableID(eni.Attrs().Index)}, netlink.RT_FILTER_TABLE)
+			assert.NoError(t, err)
+			found := false
+			for _, route := range routes {
+				if route.Dst == nil || route.Dst.IP.IsUnspecified() {
+					found = true
+					gateway := cfg.ENIGatewayIP.IPv4
+					if family == netlink.FAMILY_V6 {
+						gateway = cfg.ENIGatewayIP.IPv6
+					}
+					assert.True(t, gateway.Equal(route.Gw))
+				}
+			}
+			assert.True(t, found)
+		}
+	}
 
 	_ = containerNS.Do(func(netNS ns.NetNS) error {
 		// addr

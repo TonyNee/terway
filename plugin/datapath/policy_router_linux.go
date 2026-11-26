@@ -306,7 +306,7 @@ func GenerateENICfgForPolicy(cfg *types.SetupConfig, link netlink.Link, table in
 		Rules:     rules,
 		Neighs:    neighs,
 		SysCtl:    sysctl,
-		StripVlan: cfg.StripVlan, // if trunk enabled, will remote vlan tag
+		StripVlan: cfg.StripVlan && !cfg.CiliumDatapath,
 	}
 
 	return contCfg
@@ -316,6 +316,15 @@ func (d *PolicyRoute) Setup(ctx context.Context, cfg *types.SetupConfig, netNS n
 	eni, err := netlink.LinkByIndex(cfg.ENIIndex)
 	if err != nil {
 		return err
+	}
+	if cfg.CiliumDatapath {
+		legacy, err := utils.LegacyVLANFilters(eni)
+		if err != nil {
+			return err
+		}
+		if len(legacy) > 0 {
+			return fmt.Errorf("legacy VLAN TC filters remain on %s; drain the node and restart Terway before enabling Cilium datapath", eni.Attrs().Name)
+		}
 	}
 
 	if cfg.BandwidthMode == types.BandwidthModeEDT && cfg.Egress > 0 {
@@ -340,6 +349,11 @@ func (d *PolicyRoute) Setup(ctx context.Context, cfg *types.SetupConfig, netNS n
 	hostVETH, err := netlink.LinkByName(cfg.HostVETHName)
 	if err != nil {
 		return err
+	}
+	if cfg.CiliumDatapath && cfg.StripVlan {
+		if err := netlink.LinkSetAlias(hostVETH, types.TerwayTrunkDatapathAlias); err != nil {
+			return fmt.Errorf("mark trunk veth for Cilium datapath: %w", err)
+		}
 	}
 
 	err = netNS.Do(func(_ ns.NetNS) error {
@@ -390,7 +404,7 @@ func (d *PolicyRoute) Setup(ctx context.Context, cfg *types.SetupConfig, netNS n
 		return fmt.Errorf("setup eni config, %w", err)
 	}
 
-	if cfg.StripVlan {
+	if cfg.StripVlan && !cfg.CiliumDatapath {
 		err = utils.EnsureVlanTag(ctx, eni, cfg.ContainerIPNet, uint16(cfg.Vid))
 		if err != nil {
 			return err

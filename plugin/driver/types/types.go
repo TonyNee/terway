@@ -10,6 +10,10 @@ import (
 	cniTypes "github.com/containernetworking/cni/pkg/types"
 )
 
+// TerwayTrunkDatapathAlias marks a host veth whose trunk VLAN actions are
+// delegated to Cilium. The chainer reads the alias from its existing link lookup.
+const TerwayTrunkDatapathAlias = "terway-trunk-datapath"
+
 // CNIConf is the cni network config
 type CNIConf struct {
 	cniTypes.NetConf
@@ -75,7 +79,13 @@ type VlanStripType string
 const (
 	VlanStripTypeFilter = "filter"
 	VlanStripTypeVlan   = "vlan"
+	VlanStripTypeCilium = "cilium"
 )
+
+// CiliumDatapath delegates VLAN handling to the built-in Cilium datapath plugin.
+func (n *CNIConf) CiliumDatapath() bool {
+	return n.VlanStripType == VlanStripTypeCilium
+}
 
 type DataPath int
 
@@ -118,6 +128,8 @@ type SetupConfig struct {
 	// StripVlan or use vlan
 	StripVlan bool
 	Vid       int
+	// CiliumDatapath changes VLAN handling only; StripVlan still describes the trunk.
+	CiliumDatapath bool
 
 	DefaultRoute bool
 	MultiNetwork bool
