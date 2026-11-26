@@ -1087,6 +1087,7 @@ func Test_runCilium_ArgumentsAndEnvironment(t *testing.T) {
 	assert.Contains(t, capturedArgs, "--enable-ipv4-masquerade=false")
 	assert.Contains(t, capturedArgs, "--enable-ipv6-masquerade=false")
 	assert.Contains(t, capturedArgs, "--agent-health-port=9099")
+	assert.NotContains(t, capturedArgs, "--enable-session-affinity=true", "Cilium no longer accepts the global session affinity flag")
 
 	// Verify datapath-specific arguments
 	assert.Contains(t, capturedArgs, "--datapath-mode=veth")

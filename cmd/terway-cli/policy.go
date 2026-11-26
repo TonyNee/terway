@@ -223,7 +223,6 @@ func runCilium(cfg *PolicyConfig) error {
 		"--enable-health-checking=false",
 		"--enable-service-topology=true",
 		"--k8s-heartbeat-timeout=0",
-		"--enable-session-affinity=true",
 		"--install-iptables-rules=true",
 		"--enable-l7-proxy=false",
 		"--ipam=delegated-plugin",
