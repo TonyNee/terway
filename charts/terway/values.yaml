@@ -18,6 +18,9 @@ terway:
   # daemonMode: options [ ENIMultiIP ]
   daemonMode: ENIMultiIP
   enableDatapathV2: false
+  # VLAN handling: filter (legacy TC), vlan (VLAN device), cilium (built-in DP).
+  # cilium requires enableDatapathV2 and a drained node when switching modes.
+  vlanStripType: filter
   networkPolicyProvider: ebpf
   enableNetworkPolicy: false
 

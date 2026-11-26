@@ -1,6 +1,9 @@
 {{- if and (or (eq .Values.terway.ipStack "ipv6") (eq .Values.terwayControlplane.ipStack "ipv6")) (ne .Values.terway.ipStack .Values.terwayControlplane.ipStack) }}
 {{- fail "IPv6-only requires matching terway.ipStack and terwayControlplane.ipStack" }}
 {{- end }}
+{{- if and (eq .Values.terway.vlanStripType "cilium") (or (not .Values.terway.enableDatapathV2) (ne .Values.terway.daemonMode "ENIMultiIP")) }}
+{{- fail "vlanStripType=cilium requires enableDatapathV2=true and daemonMode=ENIMultiIP" }}
+{{- end }}
 kind: ConfigMap
 apiVersion: v1
 metadata:
@@ -32,6 +35,7 @@ data:
       "name": "terway",
       "capabilities": {"bandwidth": true},
       "network_policy_provider": "{{.Values.terway.networkPolicyProvider}}",
+      "vlan_strip_type": "{{ .Values.terway.vlanStripType | default "filter" }}",
       {{- if .Values.terway.ciliumArgs }}
       "cilium_args": "{{.Values.terway.ciliumArgs}}",
       {{- end}}
