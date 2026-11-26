@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/AliyunContainerService/terway/pkg/version"
+	driverTypes "github.com/AliyunContainerService/terway/plugin/driver/types"
 	"github.com/AliyunContainerService/terway/types"
 )
 
@@ -142,7 +143,7 @@ func processInput() error {
 		return err
 	}
 
-	return os.WriteFile(outPutPath, []byte(out), 0644)
+	return writeCNIConfig(outPutPath, out)
 }
 
 func resolveCNIChain(cm *TerwayConfig) ([]byte, bool, error) {
@@ -293,6 +294,45 @@ func mergeConfigList(configs [][]byte, f *feature) (string, error) {
 	datapath := ""
 
 	networkPolicyProvider := NetworkPolicyProviderIpt
+	ciliumDatapath := false
+	// Validate the primary config before emitting either half of the DP contract.
+	for _, config := range configs {
+		plugin, err := gabs.ParseJSON(config)
+		if err != nil {
+			return "", err
+		}
+		if plugin.Path("type").Data() != pluginTypeTerway {
+			continue
+		}
+		var conf driverTypes.CNIConf
+		if err := json.Unmarshal(config, &conf); err != nil {
+			return "", err
+		}
+		if conf.CiliumDatapath() {
+			if !ebpfSupport || conf.ENIIPVirtualType != dataPathV2 || conf.DisableHostPeer {
+				return "", fmt.Errorf("vlan_strip_type=cilium requires eBPF, explicit datapathv2 and a host veth peer")
+			}
+			ciliumDatapath = true
+		}
+	}
+	if ciliumDatapath {
+		primarySeen, chainerSeen := false, false
+		for _, config := range configs {
+			plugin, _ := gabs.ParseJSON(config)
+			switch plugin.Path("type").Data() {
+			case pluginTypeTerway:
+				if primarySeen {
+					return "", fmt.Errorf("cilium datapath requires one Terway primary plugin")
+				}
+				primarySeen = true
+			case pluginTypeCilium:
+				if !primarySeen || chainerSeen {
+					return "", fmt.Errorf("cilium datapath requires one cilium-cni after Terway")
+				}
+				chainerSeen = true
+			}
+		}
+	}
 
 	for _, config := range configs {
 		plugin, err := gabs.ParseJSON(config)
@@ -309,6 +349,12 @@ func mergeConfigList(configs [][]byte, f *feature) (string, error) {
 
 		switch pluginType {
 		case pluginTypeCilium:
+			if requested, ok := plugin.Path("terway-datapath").Data().(bool); plugin.Exists("terway-datapath") && (!ok || requested != ciliumDatapath) {
+				return "", fmt.Errorf("cilium-cni terway-datapath must match Terway vlan_strip_type=cilium")
+			}
+			if ciliumDatapath {
+				_, _ = plugin.Set(true, "terway-datapath")
+			}
 			// make sure cilium-cni is behind terway
 			if !ebpfSupport {
 				continue
@@ -424,7 +470,11 @@ func mergeConfigList(configs [][]byte, f *feature) (string, error) {
 	}
 
 	if ebpfSupport && requireEBPFChainer && !ebpfChainerExist {
-		err = g.ArrayAppend(map[string]any{"type": "cilium-cni", "enable-debug": false, "log-file": "/var/run/cilium/cilium-cni.log", "data-path": datapath}, "plugins")
+		chainer := map[string]any{"type": "cilium-cni", "enable-debug": false, "log-file": "/var/run/cilium/cilium-cni.log", "data-path": datapath}
+		if ciliumDatapath {
+			chainer["terway-datapath"] = true
+		}
+		err = g.ArrayAppend(chainer, "plugins")
 		if err != nil {
 			return "", err
 		}
@@ -500,6 +550,7 @@ func storeRuntimeConfig(filePath string, container *gabs.Container) error {
 	}
 
 	hasCilium := false
+	ciliumDatapath := false
 	// write back current runtime config
 	for _, plugin := range container.Path("plugins").Children() {
 		pluginType, ok := plugin.Path("type").Data().(string)
@@ -516,6 +567,7 @@ func storeRuntimeConfig(filePath string, container *gabs.Container) error {
 			}
 			hasCilium = true
 		case pluginTypeTerway:
+			ciliumDatapath = plugin.Path("vlan_strip_type").Data() == driverTypes.VlanStripTypeCilium
 			if plugin.Exists("network_policy_provider") {
 				networkPolicyProvider := plugin.Path("network_policy_provider").Data().(string)
 				store.Set(nodecap.NodeCapabilityNetworkPolicyProvider, networkPolicyProvider)
@@ -531,6 +583,7 @@ func storeRuntimeConfig(filePath string, container *gabs.Container) error {
 	} else {
 		store.Set(nodecap.NodeCapabilityHasCiliumChainer, False)
 	}
+	store.Set(nodecap.NodeCapabilityCiliumDatapath, fmt.Sprint(ciliumDatapath))
 
 	return store.Save()
 }

@@ -18,6 +18,7 @@ const (
 	NodeCapabilityDataPath              = "datapath"
 	NodeCapabilityNetworkPolicyProvider = "network_policy_provider"
 	NodeCapabilityHasCiliumChainer      = "has_cilium_chainer"
+	NodeCapabilityCiliumDatapath        = "cilium_datapath"
 	NodeCapabilityKubeProxyReplacement  = "kube_proxy_replacement"
 )
 

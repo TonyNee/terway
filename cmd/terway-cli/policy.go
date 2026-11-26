@@ -33,6 +33,7 @@ type PolicyConfig struct {
 	InClusterLoadBalance bool
 	HasCiliumChainer     bool
 	EnableKPR            bool
+	CiliumDatapath       bool
 }
 
 type CNIConfig struct {
@@ -85,6 +86,10 @@ func getPolicyConfig(capFilePath string) (*PolicyConfig, error) {
 	cfg.PolicyProvider = store.Get(nodecap.NodeCapabilityNetworkPolicyProvider)
 	cfg.HasCiliumChainer = store.Get(nodecap.NodeCapabilityHasCiliumChainer) == True
 	cfg.EnableKPR = store.Get(nodecap.NodeCapabilityKubeProxyReplacement) == True
+	cfg.CiliumDatapath = store.Get(nodecap.NodeCapabilityCiliumDatapath) == True
+	if cfg.CiliumDatapath && (cfg.ExclusiveENI || cfg.Datapath != dataPathV2 || !cfg.HasCiliumChainer) {
+		return nil, fmt.Errorf("cilium datapath requires datapathv2 shared ENI and cilium-cni")
+	}
 
 	cfg.HealthCheckPort = os.Getenv("FELIX_HEALTHPORT")
 	if cfg.HealthCheckPort == "" {
@@ -267,6 +272,21 @@ func runCilium(cfg *PolicyConfig) error {
 	}
 
 	args = append(args, extraArgs...)
+	// This flag is owned by the generated CNI configuration. In particular, a
+	// legacy cilium_args override must not enable only one half of the contract.
+	for _, arg := range extraArgs {
+		key := strings.SplitN(arg, "=", 2)[0]
+		if key == "--enable-terway-datapath" {
+			return fmt.Errorf("configure Cilium datapath using vlan_strip_type instead of cilium_args")
+		}
+		if cfg.CiliumDatapath && (key == "--datapath-mode" || key == "--routing-mode" || key == "--cni-chaining-mode") {
+			return fmt.Errorf("%s is managed by Terway in Cilium datapath mode", key)
+		}
+	}
+	if cfg.CiliumDatapath && cfg.Datapath != dataPathV2 {
+		return fmt.Errorf("cilium datapath requires datapathv2")
+	}
+	args = append(args, "--enable-terway-datapath="+fmt.Sprint(cfg.CiliumDatapath))
 
 	args, err = mutateCiliumArgs(args)
 	if err != nil {

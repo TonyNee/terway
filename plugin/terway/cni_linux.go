@@ -177,6 +177,11 @@ func doCmdAdd(ctx context.Context, client rpc.TerwayBackendClient, cmdArgs *cniC
 	}
 
 	multiNetwork := len(allocResult.NetConfs) > 1
+	for _, alloc := range allocResult.NetConfs {
+		if usesTrunkDatapath(conf, alloc, allocResult.IPType) && len(allocResult.NetConfs) != 1 {
+			return nil, nil, fmt.Errorf("cilium datapath requires exactly one primary network interface")
+		}
+	}
 
 	l, err := utils.GrabFileLock(terwayCNILock)
 	if err != nil {

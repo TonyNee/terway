@@ -3,6 +3,8 @@
 package main
 
 import (
+	"os"
+
 	"github.com/AliyunContainerService/terway/plugin/driver/types"
 )
 
@@ -33,3 +35,5 @@ func configureNetworkRulesWithConfig(ipv4, ipv6 bool, config *types.SymmetricRou
 func mountHostBpf() error { return nil }
 
 func detectMTU() int { return defaultMTU }
+
+func writeCNIConfig(path, out string) error { return os.WriteFile(path, []byte(out), 0644) }

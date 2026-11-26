@@ -234,6 +234,19 @@ func getNetworkClient(ctx context.Context) (rpc.TerwayBackendClient, *grpc.Clien
 }
 
 func parseSetupConf(ctx context.Context, args *skel.CmdArgs, alloc *rpc.NetConf, conf *types.CNIConf, ipType rpc.IPType) (*types.SetupConfig, error) {
+	ciliumDatapath := usesTrunkDatapath(conf, alloc, ipType)
+	if ciliumDatapath {
+		if conf.ENIIPVirtualType != "datapathv2" || conf.DisableHostPeer || ipType != rpc.IPType_TypeENIMultiIP {
+			return nil, fmt.Errorf("cilium datapath requires datapathv2 shared ENI with a host veth peer")
+		}
+		eni := alloc.GetENIInfo()
+		if eni == nil || eni.GetMAC() == "" || eni.VfId != nil || eni.GetERDMA() || (alloc.IfName != "" && alloc.IfName != args.IfName) {
+			return nil, fmt.Errorf("cilium datapath requires a primary ENI interface without RDMA or VF")
+		}
+		if (eni.GetTrunk() && (eni.GetVid() == 0 || eni.GetVid() > 4094)) || (!eni.GetTrunk() && eni.GetVid() != 0) {
+			return nil, fmt.Errorf("invalid VLAN binding for Cilium datapath")
+		}
+	}
 	var (
 		err            error
 		containerIPNet *terwayTypes.IPNetSet
@@ -387,6 +400,7 @@ func parseSetupConf(ctx context.Context, args *skel.CmdArgs, alloc *rpc.NetConf,
 		Ingress:               ingress,
 		Egress:                egress,
 		StripVlan:             trunkENI,
+		CiliumDatapath:        ciliumDatapath,
 		Vid:                   int(vid),
 		DefaultRoute:          alloc.GetDefaultRoute(),
 		ExtraRoutes:           routes,
@@ -516,6 +530,9 @@ func getDatePath(ipType rpc.IPType, vlanStripType types.VlanStripType, trunk boo
 		}
 		return types.ExclusiveENI
 	case rpc.IPType_TypeENIMultiIP:
+		if trunk && vlanStripType == types.VlanStripTypeCilium {
+			return types.PolicyRoute
+		}
 		if trunk && vlanStripType == types.VlanStripTypeVlan {
 			return types.Vlan
 		}

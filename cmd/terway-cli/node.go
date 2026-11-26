@@ -225,6 +225,7 @@ func setExclusiveMode(store nodecap.NodeCapabilitiesStore, labels map[string]str
 		}
 		// CNI generation recorded capabilities before the exclusive-mode rewrite.
 		store.Set(nodecap.NodeCapabilityHasCiliumChainer, False)
+		store.Set(nodecap.NodeCapabilityCiliumDatapath, False)
 		return store.Save()
 	}
 	return nil
